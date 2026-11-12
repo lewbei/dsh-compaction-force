@@ -80,7 +80,7 @@ if (force === undefined) {
 }
 const forceAtTokens = force.config?.forceAtTokens ?? 262144
 const minContextWindow = force.config?.minContextWindow ?? 500000
-console.log(`Guarded compaction-force: forceAtTokens=${forceAtTokens} minContextWindow=${minContextWindow} note=${force.config?.note ?? 'both'}`)
+console.log(`Guarded compaction-force: forceAtTokens=${forceAtTokens} minContextWindow=${minContextWindow} note=${force.config?.note ?? 'handoff'}`)
 
 const models = [...DEEPSEEK_ROUTES]
 const piAi = composed.find((row) => row?.id === 'llm-pi-ai')
