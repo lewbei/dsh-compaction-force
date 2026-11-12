@@ -192,6 +192,9 @@ export async function collectCatalog(llm) {
 
 /** Cached catalog: one enumeration per llm service per TTL, shared by engines. */
 export function catalogFor(llm) {
+  // A missing/non-object llm service must degrade to an empty catalog instead
+  // of throwing inside the WeakMap (unhandled rejection) during install.
+  if (llm === null || typeof llm !== 'object') return Promise.resolve([])
   const hit = catalogCache.get(llm)
   const now = Date.now()
   if (hit !== undefined && hit.models !== undefined && now - hit.at < CATALOG_TTL_MS) return Promise.resolve(hit.models)

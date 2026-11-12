@@ -654,6 +654,18 @@ await test('apply: a second instance still installs policies while the first hol
   assert.equal(result.summary.length, 2, 'exactly one wrapper must append its note')
 })
 
+await test('apply: with no llm service installs nothing and does not crash', async () => {
+  const engine = makeEngine()
+  const ctx = fakeCtx({ compaction: engine, tokenMeter: { measure: () => ({ totalTokens: 5000 }) } })
+  ctx.logger.owner = ctx
+  apply(ctx, { forceAtTokens: 262144, minContextWindow: 500000 })
+  await tick()
+  await tick()
+  assert.equal(engine.config.modelPolicies.length, 0, 'no llm means no policies')
+  assert.deepEqual(await catalogFor(undefined), [])
+  assert.deepEqual(await catalogFor(null), [])
+})
+
 await test('plugin module has the expected name', async () => {
   const module = await import('./index.js')
   assert.equal(module.name, 'compaction-force')
