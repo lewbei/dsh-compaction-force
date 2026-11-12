@@ -149,7 +149,9 @@ An earlier numbered table (50/33/100/100 %) came from a separate disposable
 harness (`hype/dsh-compaction-ab/`) that is **not** shipped in this public
 repository; it remains recorded external evidence and is not reproduced here.
 Run `node benchmarks/compint-run/retention-bench.mjs` to regenerate the table
-above.
+above; `node benchmarks/compint-run/retention-bench.mjs --full` runs the large
+3-seed × 100-instance × 3-generation configuration recorded in
+`benchmarks/compint-run/RESULTS-full.md`.
 
 ## Live mounting
 
