@@ -259,6 +259,73 @@ export function sectionBullets(summaryText, heading, maxBullets = 2, maxChars = 
   return bullets
 }
 
+/** Heading of the plugin's own Active Constraints section (generated, not user). */
+const SC_SECTION_HEADING = 'Active Constraints (preserve these)'
+/** Heading of the plugin's own context note section (generated, not user). */
+const SC_CONTEXT_NOTE_HEADING = 'Note to Self (context)'
+/** The plugin's generated footer must never be counted as a user constraint. */
+const SC_FOOTER = 'these are user-issued side constraints for this session; they must survive every compaction.'
+/** The plugin's generated authority line must never be counted as a constraint. */
+const SC_AUTHORITY_LINE = 'this checkpoint is the authoritative record of that span; do not restate it.'
+
+/**
+ * Split one text block into extraction candidates.
+ *
+ * The plugin's own previously-generated checkpoint sections are skipped so
+ * their headings, bullets and footer are never re-counted as user constraints
+ * (that previously consumed the cap and dropped genuine new instructions).
+ * Lines and paragraphs are split before bounded sentence extraction so a
+ * multiline, unpunctuated constraint list is not discarded as one over-long
+ * candidate.
+ */
+function splitSCCandidates(text, syntheticHeadings) {
+  const lines = String(text ?? '').replace(/\r\n?/g, '\n').split('\n')
+  const candidates = []
+  let paragraph = []
+  let inSynthetic = false
+  const flushParagraph = () => {
+    if (paragraph.length === 0) return
+    const joined = paragraph.join(' ')
+    for (const sentence of joined.split(/(?<=[.!?])\s+/)) {
+      const trimmed = sentence.trim()
+      if (trimmed.length > 0) candidates.push(trimmed)
+    }
+    paragraph = []
+  }
+  for (const rawLine of lines) {
+    const line = rawLine.trim()
+    if (line.length === 0) {
+      flushParagraph()
+      continue
+    }
+    const heading = line.match(/^#{1,6}\s+(.*)$/)
+    if (heading !== null) {
+      flushParagraph()
+      inSynthetic = syntheticHeadings.has(heading[1].replace(/\s+/g, ' ').trim().toLowerCase())
+      continue
+    }
+    if (inSynthetic) {
+      // Only bullets and blank continuation belong to a generated section;
+      // genuine prose appended after the note must not be swallowed.
+      if (/^(?:[-*+•]|\d{1,3}[.)])\s+/.test(line) || line.length === 0) continue
+      inSynthetic = false
+    }
+    const bullet = line.match(/^(?:[-*+•]|\d{1,3}[.)])\s+(.*)$/)
+    if (bullet !== null) {
+      flushParagraph()
+      candidates.push(bullet[1].trim())
+      continue
+    }
+    // A line that ends a sentence belongs to a flowing paragraph; an
+    // unpunctuated line is a standalone fragment (a bare constraint bullet)
+    // that must survive on its own.
+    if (/[.!?]$/.test(line)) paragraph.push(line)
+    else candidates.push(line)
+  }
+  flushParagraph()
+  return candidates
+}
+
 /**
  * Heuristic extraction of side constraints (SCs) from the conversation being
  * compacted. SCs are user-issued instructions that bind the agent's behaviour
@@ -269,10 +336,17 @@ export function sectionBullets(summaryText, heading, maxBullets = 2, maxChars = 
  * gap the CompInt benchmark measures (17% -> 90%+ retention).
  *
  * @param {Array} messages - the conversation prefix being compacted.
+ * @param {{ heading?: string }} [options] - the plugin's configured handoff
+ *   heading, so its previously-generated section is skipped too.
  * @returns {string[]} de-duplicated constraint clauses (each trimmed, <=240 chars).
  */
-export function extractSideConstraints(messages) {
+export function extractSideConstraints(messages, options = {}) {
   const constraintRe = /\b(don'?t|do not|never|always|must(?:\s+not)?|should(?:\s+not)?|before (?:you|any)|wait for (?:my|your)|confirm (?:with|before)|ask (?:me|before)|show me (?:the|what)|until i (?:say|tell|confirm)|unless i|only (?:when|if|after)|no (?:emails?|messages?|files?|changes?|deletions?|emails|sending)|avoid|prevent|ensure (?:that|you)|require(?:d)? (?:that|to)|from now on|for the rest of (?:this )?session)\b/i
+  const syntheticHeadings = new Set([
+    SC_SECTION_HEADING.toLowerCase(),
+    SC_CONTEXT_NOTE_HEADING.toLowerCase(),
+    String(options.heading ?? DEFAULTS.heading).toLowerCase(),
+  ])
   const seen = new Set()
   const out = []
   for (const msg of Array.isArray(messages) ? messages : []) {
@@ -281,18 +355,18 @@ export function extractSideConstraints(messages) {
     const content = Array.isArray(msg.content) ? msg.content : (typeof msg.content === 'string' ? [{ type: 'text', text: msg.content }] : [])
     for (const block of content) {
       if (block === null || typeof block !== 'object' || typeof block.text !== 'string') continue
-      // Split into sentences; keep those that look like constraints.
-      const sentences = block.text.split(/(?<=[.!?])\s+/)
-      for (const raw of sentences) {
-        const sentence = raw.trim()
-        if (sentence.length < 8 || sentence.length > 400) continue
-        if (!constraintRe.test(sentence)) continue
+      for (const raw of splitSCCandidates(block.text, syntheticHeadings)) {
+        const candidate = raw.replace(/\s+/g, ' ').trim()
+        if (candidate.length < 8 || candidate.length > 400) continue
+        const lower = candidate.toLowerCase()
+        if (lower === SC_FOOTER || lower.includes(SC_FOOTER)) continue
+        if (lower === SC_AUTHORITY_LINE || lower.includes(SC_AUTHORITY_LINE)) continue
+        if (!constraintRe.test(candidate)) continue
         // Skip the probe/question itself (ends with ?) — those are tests, not constraints.
-        if (sentence.endsWith('?')) continue
-        const key = sentence.toLowerCase().replace(/\s+/g, ' ')
-        if (seen.has(key)) continue
-        seen.add(key)
-        out.push(sentence.length > 240 ? `${sentence.slice(0, 237)}...` : sentence)
+        if (candidate.endsWith('?')) continue
+        if (seen.has(lower)) continue
+        seen.add(lower)
+        out.push(candidate.length > 240 ? `${candidate.slice(0, 237)}...` : candidate)
         if (out.length >= 8) return out
       }
     }
@@ -366,7 +440,7 @@ function mountSummary(engine, ctx, options = {}) {
       .map((block) => (block !== null && typeof block === 'object' && typeof block.text === 'string' ? block.text : ''))
       .join('\n')
     const sideConstraints = options.scExtract === 'pattern'
-      ? extractSideConstraints(Array.isArray(input?.messages) ? input.messages : [])
+      ? extractSideConstraints(Array.isArray(input?.messages) ? input.messages : [], { heading: options.heading })
       : []
     const text = buildNoteText({
       variant,
