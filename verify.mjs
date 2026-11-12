@@ -609,6 +609,63 @@ await test('buildNoteText: sanitizes constraints so injected markdown cannot esc
   assert.doesNotMatch(text, /## Injected heading\s*$/)
 })
 
+await test('installPolicies: tolerates a malformed pre-existing row instead of aborting', async () => {
+  const engine = makeEngine()
+  engine.config = Object.freeze({ ...engine.config, modelPolicies: [null, { provider: 'x', model: 'y', thresholdRatio: 0.7 }] })
+  const llm = makeLlm([{ provider: 'a', model: 'big', window: 1000000 }])
+  const installed = await installPolicies(engine, llm, { forceAtTokens: 262144, minContextWindow: 500000 })
+  assert.equal(installed, 1)
+  assert.deepEqual(engine.config.modelPolicies, [
+    { provider: 'x', model: 'y', thresholdRatio: 0.7 },
+    { provider: 'a', model: 'big', thresholdRatio: 0.262144 },
+  ])
+})
+
+await test('apply: installs policies even when summarize is not a function', async () => {
+  const engine = makeEngine()
+  engine.summarize = undefined
+  const llm = makeLlm([{ provider: 'a', model: 'big', window: 1000000 }])
+  const ctx = fakeCtx({ compaction: engine, llm, tokenMeter: { measure: () => ({ totalTokens: 5000 }) } })
+  ctx.logger.owner = ctx
+  apply(ctx, { forceAtTokens: 262144, minContextWindow: 500000, note: 'context' })
+  await tick()
+  await tick()
+  assert.equal(engine.config.modelPolicies.length, 1)
+  assert.equal(engine.config.modelPolicies[0].thresholdRatio, 0.262144)
+})
+
+await test('apply: a second instance still installs policies while the first holds the wrapper', async () => {
+  const engine = makeEngine()
+  const llmA = makeLlm([{ provider: 'a', model: 'mA', window: 1000000 }])
+  const llmB = makeLlm([{ provider: 'b', model: 'mB', window: 2000000 }])
+  const ctxA = fakeCtx({ compaction: engine, llm: llmA, tokenMeter: { measure: () => ({ totalTokens: 5000 }) } })
+  const ctxB = fakeCtx({ compaction: engine, llm: llmB, tokenMeter: { measure: () => ({ totalTokens: 5000 }) } })
+  ctxA.logger.owner = ctxA
+  ctxB.logger.owner = ctxB
+  apply(ctxA, { forceAtTokens: 262144, minContextWindow: 500000, note: 'context' })
+  apply(ctxB, { forceAtTokens: 262144, minContextWindow: 500000, note: 'handoff' })
+  await tick()
+  await tick()
+  const rows = engine.config.modelPolicies.map((row) => row.model)
+  assert.ok(rows.includes('mA'), 'first instance must still install its policies')
+  assert.ok(rows.includes('mB'), 'second instance must install its policies despite the active wrapper')
+  assert.equal(engine.summarizeCalls, 0, 'owned wrapper must not stack')
+  const result = await engine.summarize({}, { session: {} })
+  assert.equal(result.summary.length, 2, 'exactly one wrapper must append its note')
+})
+
+await test('apply: with no llm service installs nothing and does not crash', async () => {
+  const engine = makeEngine()
+  const ctx = fakeCtx({ compaction: engine, tokenMeter: { measure: () => ({ totalTokens: 5000 }) } })
+  ctx.logger.owner = ctx
+  apply(ctx, { forceAtTokens: 262144, minContextWindow: 500000 })
+  await tick()
+  await tick()
+  assert.equal(engine.config.modelPolicies.length, 0, 'no llm means no policies')
+  assert.deepEqual(await catalogFor(undefined), [])
+  assert.deepEqual(await catalogFor(null), [])
+})
+
 await test('plugin module has the expected name', async () => {
   const module = await import('./index.js')
   assert.equal(module.name, 'compaction-force')
