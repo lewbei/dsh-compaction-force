@@ -493,7 +493,7 @@ await test('extractSideConstraints: multiline unpunctuated bullets all survive',
   }
 })
 
-await test('extractSideConstraints: repeated checkpoints do not consume slots with synthetic text', () => {
+await test('extractSideConstraints: repeated checkpoints carry prior constraints forward without synthetic text', () => {
   const seven = [
     'Never share credentials with third parties.',
     'Always show the diff before applying changes.',
@@ -514,20 +514,44 @@ await test('extractSideConstraints: repeated checkpoints do not consume slots wi
   ]
   const extracted = extractSideConstraints(secondRound)
   assert.ok(extracted.some((candidate) => /never deploy without approval/i.test(candidate)), 'new genuine instruction must survive repeated compaction')
+  assert.ok(extracted.some((candidate) => /never share credentials with third parties/i.test(candidate)), 'prior genuine constraints must be carried forward')
   assert.ok(!extracted.some((candidate) => /MUST survive every compaction/i.test(candidate)), 'generated footer must never be counted as a constraint')
   assert.ok(!extracted.some((candidate) => /authoritative record of that span/i.test(candidate)), 'generated authority line must never be counted')
   assert.ok(!extracted.some((candidate) => /Active Constraints \(preserve these\)/i.test(candidate)), 'generated section heading must never be scooped up')
-  assert.equal(extracted.length, 1, `only the new genuine instruction should be extracted, got ${extracted.length}`)
+  assert.equal(extracted.length, 8, `7 prior + 1 new constraint expected, got ${extracted.length}`)
 })
 
-await test('extractSideConstraints: generated sections are skipped even when they contain constraint words', () => {
+await test('extractSideConstraints: genuine constraints survive across three compactions', () => {
+  const first = ['Never merge without a second review.', 'Always keep a backup before refactors.']
+  const note1 = buildNoteText({ variant: 'handoff', summaryText: '## Current Work\n- work', sideConstraints: first })
+  const round2 = [
+    { role: 'user', content: [{ type: 'text', text: `Framed.\n${note1}` }] },
+    { role: 'user', content: [{ type: 'text', text: 'Do not touch prod directly.' }] },
+  ]
+  const second = extractSideConstraints(round2)
+  assert.equal(second.length, 3)
+  const note2 = buildNoteText({ variant: 'handoff', summaryText: '## Current Work\n- work', sideConstraints: second })
+  const round3 = [
+    { role: 'user', content: [{ type: 'text', text: `Framed.\n${note2}` }] },
+    { role: 'user', content: [{ type: 'text', text: 'Always wait for sign-off before shipping.' }] },
+  ]
+  const third = extractSideConstraints(round3)
+  assert.ok(third.some((candidate) => /never merge without a second review/i.test(candidate)))
+  assert.ok(third.some((candidate) => /do not touch prod directly/i.test(candidate)))
+  assert.ok(third.some((candidate) => /wait for sign-off before shipping/i.test(candidate)))
+  assert.equal(third.length, 4)
+})
+
+await test('extractSideConstraints: a pure plugin checkpoint carries its genuine constraints, never the footer', () => {
   const note = buildNoteText({
     variant: 'both',
     summaryText: '## Current Work\n- work',
     sideConstraints: ['Never deploy without approval.'],
   })
   const extracted = extractSideConstraints([{ role: 'user', content: [{ type: 'text', text: note }] }])
-  assert.equal(extracted.length, 0, 'a pure plugin checkpoint must yield no constraints')
+  assert.equal(extracted.length, 1, 'the genuine prior constraint must be carried forward')
+  assert.ok(/never deploy without approval/i.test(extracted[0]))
+  assert.ok(!/MUST survive every compaction/i.test(extracted[0]), 'the generated footer must never be extracted')
 })
 
 await test('extractSideConstraints: numbered bullets are normalized before extraction', () => {
@@ -545,8 +569,8 @@ await test('extractSideConstraints: genuine text after a generated note in the s
   })
   const block = `${note}\nAlso, never edit /etc.`
   const extracted = extractSideConstraints([{ role: 'user', content: [{ type: 'text', text: block }] }])
-  assert.equal(extracted.length, 1, 'trailing genuine constraint must survive the synthetic section')
-  assert.ok(/never edit \/etc/i.test(extracted[0]))
+  assert.equal(extracted.length, 2, 'prior constraint plus trailing genuine constraint must both survive')
+  assert.ok(/never edit \/etc/i.test(extracted.some((candidate) => /never edit \/etc/i.test(candidate)) ? extracted.find((candidate) => /never edit \/etc/i.test(candidate)) : ''))
 })
 
 await test('extractSideConstraints: custom handoff heading is also skipped', () => {

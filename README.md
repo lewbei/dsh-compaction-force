@@ -127,24 +127,29 @@ Config: `forceAtTokens` (default 262144), `minContextWindow` (default 500000),
 threshold with `note` = `off | context | handoff | both` and scores
 post-compaction recall + continuation. See that directory's `RESULTS.md`.
 
-## Benchmark result (CompInt side-constraint retention, 10 instances, beam-free)
+## Benchmark result (CompInt side-constraint retention)
 
-| Arm | Retention | Effective retention |
+The in-repo harness `benchmarks/compint-run/retention-bench.mjs` measures this
+plugin against a simulated task-centric summarizer that drops instructions
+(deterministic seed, 10 instances × 6 constraints per arm, no LLM):
+
+| Arm | Retention | Intact retention |
 |---|---:|---:|
-| off (no note) | 50 % | 50 % |
-| context | 50 % | 33 % |
+| off | 0 % | 0 % |
+| context | 100 % | 100 % |
 | **handoff (recommended)** | **100 %** | **100 %** |
-| both | 90 % | 100 % |
+| both | 100 % | 100 % |
 
-The `handoff` note's "Active Constraints" section extracts side constraints from
-the raw conversation before compaction and re-injects them, closing the gap the
-CompInt paper measures (17 % -> 90 %+).
+Repeated-compaction experiment (handoff arm): prior constraints survive a second
+compaction in 10/10 scenarios, and a new instruction added before it also
+survives 10/10. Full protocol, definitions, and limits are in
+`benchmarks/compint-run/RESULTS.md`.
 
-These numbers come from a separate disposable harness (`hype/dsh-compaction-ab/`)
-that is **not** shipped in this public repository; the table is recorded
-evidence, not reproduced by the suites in this repo. The in-repo `verify*.mjs`
-suites validate the mechanics (retention, extraction, lifecycle), not the
-benchmark percentages.
+An earlier numbered table (50/33/100/100 %) came from a separate disposable
+harness (`hype/dsh-compaction-ab/`) that is **not** shipped in this public
+repository; it remains recorded external evidence and is not reproduced here.
+Run `node benchmarks/compint-run/retention-bench.mjs` to regenerate the table
+above.
 
 ## Live mounting
 
