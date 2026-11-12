@@ -475,6 +475,87 @@ await test('installPolicies: same-key merge replaces a now-invalid retention wit
   assert.ok(row.retainRatio > 0 && row.retainRatio < row.thresholdRatio)
 })
 
+await test('extractSideConstraints: multiline unpunctuated bullets all survive', () => {
+  const bullets = [
+    'Never deploy without explicit approval',
+    'Always run the full test suite first',
+    'Do not touch the live profile',
+    'Never push directly to main',
+    'Always create a branch for changes',
+    'Do not send emails without review',
+    'Never share credentials in chat',
+    'Always wait for review before merging',
+  ]
+  const extracted = extractSideConstraints([{ role: 'user', content: [{ type: 'text', text: bullets.join('\n') }] }])
+  assert.equal(extracted.length, bullets.length, `expected ${bullets.length} constraints, got ${extracted.length}`)
+  for (const bullet of bullets) {
+    assert.ok(extracted.some((candidate) => candidate.toLowerCase().includes(bullet.toLowerCase())), `missing bullet: ${bullet}`)
+  }
+})
+
+await test('extractSideConstraints: repeated checkpoints do not consume slots with synthetic text', () => {
+  const seven = [
+    'Never share credentials with third parties.',
+    'Always show the diff before applying changes.',
+    'Do not install packages without asking first.',
+    'Never send messages to customers directly.',
+    'Always wait for my approval before merging.',
+    'Do not change the live profile without authorization.',
+    'Never delete files outside the workspace.',
+  ]
+  const firstRound = [{ role: 'user', content: [{ type: 'text', text: seven.join(' ') }] }]
+  const prior = extractSideConstraints(firstRound)
+  assert.equal(prior.length, 7)
+  const note = buildNoteText({ variant: 'handoff', summaryText: '## Current Work\n- work', sideConstraints: prior })
+  const checkpointText = `Framed checkpoint text.\n${note}`
+  const secondRound = [
+    { role: 'user', content: [{ type: 'text', text: checkpointText }] },
+    { role: 'user', content: [{ type: 'text', text: 'Never deploy without approval.' }] },
+  ]
+  const extracted = extractSideConstraints(secondRound)
+  assert.ok(extracted.some((candidate) => /never deploy without approval/i.test(candidate)), 'new genuine instruction must survive repeated compaction')
+  assert.ok(!extracted.some((candidate) => /MUST survive every compaction/i.test(candidate)), 'generated footer must never be counted as a constraint')
+  assert.ok(!extracted.some((candidate) => /authoritative record of that span/i.test(candidate)), 'generated authority line must never be counted')
+  assert.ok(!extracted.some((candidate) => /Active Constraints \(preserve these\)/i.test(candidate)), 'generated section heading must never be scooped up')
+  assert.equal(extracted.length, 1, `only the new genuine instruction should be extracted, got ${extracted.length}`)
+})
+
+await test('extractSideConstraints: generated sections are skipped even when they contain constraint words', () => {
+  const note = buildNoteText({
+    variant: 'both',
+    summaryText: '## Current Work\n- work',
+    sideConstraints: ['Never deploy without approval.'],
+  })
+  const extracted = extractSideConstraints([{ role: 'user', content: [{ type: 'text', text: note }] }])
+  assert.equal(extracted.length, 0, 'a pure plugin checkpoint must yield no constraints')
+})
+
+await test('extractSideConstraints: numbered bullets are normalized before extraction', () => {
+  const extracted = extractSideConstraints([{ role: 'user', content: [{ type: 'text', text: '1. Never deploy without approval.\n2. Always show the diff.' }] }])
+  assert.equal(extracted.length, 2)
+  assert.ok(extracted[0].startsWith('Never deploy'))
+  assert.ok(extracted[1].startsWith('Always show'))
+})
+
+await test('extractSideConstraints: genuine text after a generated note in the same block survives', () => {
+  const note = buildNoteText({
+    variant: 'handoff',
+    summaryText: '## Current Work\n- work',
+    sideConstraints: ['Never deploy without approval.'],
+  })
+  const block = `${note}\nAlso, never edit /etc.`
+  const extracted = extractSideConstraints([{ role: 'user', content: [{ type: 'text', text: block }] }])
+  assert.equal(extracted.length, 1, 'trailing genuine constraint must survive the synthetic section')
+  assert.ok(/never edit \/etc/i.test(extracted[0]))
+})
+
+await test('extractSideConstraints: custom handoff heading is also skipped', () => {
+  const heading = 'Note to Self (checkpoint)'
+  const note = buildNoteText({ variant: 'handoff', heading, summaryText: '## Critical Context\n- never edit /etc', sideConstraints: [] })
+  const extracted = extractSideConstraints([{ role: 'user', content: [{ type: 'text', text: note }] }], { heading })
+  assert.equal(extracted.length, 0, 'the configured handoff section must not leak constraint-looking bullets')
+})
+
 await test('plugin module has the expected name', async () => {
   const module = await import('./index.js')
   assert.equal(module.name, 'compaction-force')
