@@ -11,7 +11,9 @@
     "index.js",
     "cordis.patch.yml",
     "README.md",
-    "verify.mjs"
+    "verify.mjs",
+    "verify-install.mjs",
+    "scripts/prepare-patch.mjs"
   ],
   "dsh": {
     "bundle": {

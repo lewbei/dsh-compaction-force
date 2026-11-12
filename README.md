@@ -64,15 +64,27 @@ the current time; `handoff` extracts bullets from the standard summary sections
 and falls back to "Resume from the checkpoint above…" when they are absent.
 
 Config: `forceAtTokens` (default 262144), `minContextWindow` (default 500000),
-`note` = `off | context | handoff | both` (default `both`), `heading`
-(default `Note to Self (handoff)`).
+`note` = `off | context | handoff | both` (default `handoff`), `heading`
+(default `Note to Self (handoff)`), `scExtract` = `pattern | off` (default
+`pattern`, the side-constraint extractor).
 
 ## Verification
 
-- `node verify.mjs` — 19 assertions covering option normalization, policy
-  math/filtering/retention, catalog caching and error skipping, frozen-config
-  replacement + merge, section extraction, both note styles, degraded token
-  meter, error propagation, idempotent wrap, and the cordis wiring. Exit 0.
+- `node verify.mjs` — 40 assertions covering option normalization, policy
+  math/filtering/retention (including customized and retainTokens retention
+  modes and same-key field preservation), catalog caching and error skipping,
+  frozen-config replacement + merge, section extraction, both note styles,
+  degraded token meter, error propagation, idempotent wrap, multiline and
+  repeated-checkpoint constraint extraction, and the cordis wiring. Exit 0.
+- `node verify-policy-boundaries.mjs <installed DSH node_modules>` — 48
+  policy configurations plus a 72-combination retention matrix, all accepted by
+  the shipped `BasicCompactionEngine` constructor.
+- `node verify-lifecycle.mjs <installed DSH node_modules>` — 7 real-Cordis
+  lifecycle groups with the shipped engine and controlled catalog/summarizer
+  I/O.
+- `node verify-install.mjs` — 8 portable-mount fixture checks (see "Live
+  mounting") run against disposable temporary modules, never against a live
+  profile.
 - Real boot check (disposable headless profile + `--patch`, scaled
   `forceAtTokens: 500`, `minContextWindow: 1000`): pressure compaction fired on
   a tiny session (it would never fire under the default 0.8 ratio at that
@@ -123,26 +135,52 @@ post-compaction recall + continuation. See that directory's `RESULTS.md`.
 
 The `handoff` note's "Active Constraints" section extracts side constraints from
 the raw conversation before compaction and re-injects them, closing the gap the
-CompInt paper measures (17 % -> 90 %+). See `benchmarks/compint-run/`.
+CompInt paper measures (17 % -> 90 %+).
+
+These numbers come from a separate disposable harness (`hype/dsh-compaction-ab/`)
+that is **not** shipped in this public repository; the table is recorded
+evidence, not reproduced by the suites in this repo. The in-repo `verify*.mjs`
+suites validate the mechanics (retention, extraction, lifecycle), not the
+benchmark percentages.
 
 ## Live mounting
 
-The row is already in the Guarded preset:
+The tracked `cordis.patch.yml` is a **template**: the row mounts the host
+plugin by absolute path, so a path must be substituted before use. Generate the
+patch with the shipped helper (it never touches a profile or server):
 
-```yaml
-- id: compaction-force
-  name: /home/lewbei/deep_learning/hype/dsh-compaction-force/index.js
-  config:
-    forceAtTokens: 262144
-    minContextWindow: 500000
-    note: both
+```sh
+node scripts/prepare-patch.mjs /abs/path/to/dsh-compaction-force/index.js \
+  --out /tmp/compaction-force.patch.yml
 ```
 
-It takes effect after a **full DSH restart** for every Guarded session (the live
-process keeps the previously imported module in its ESM cache; the preset grid
-and its compaction engine are rebuilt at boot). The live profile config is
-otherwise unchanged — note that the profile's **default preset is Standard**, so
-Standard sessions get none of this: select **Guarded** when creating a session.
+A generated patch looks like:
+
+```yaml
+- insert:
+    - id: compaction-force
+      name: "/abs/path/to/dsh-compaction-force/index.js"
+      config:
+        forceAtTokens: 262144
+        minContextWindow: 500000
+        note: handoff
+```
+
+Mounting rules:
+- The row **must** sit inside the compaction isolate group (the `compaction`
+  service is isolated there). The Guarded preset does exactly that. Applied at
+  a profile root the patch is inert in the web profile (its root
+  compaction-basic row is disabled) and only meaningful in a profile whose root
+  engine exists, e.g. the headless harness.
+- The patch takes effect only after a **full DSH restart** of the target
+  profile (the live process keeps previously imported modules in its ESM
+  cache; the preset grid and its compaction engine are rebuilt at boot).
+- Validate the procedure on a disposable profile clone first (`node
+  verify-install.mjs` checks the patch generation and template/README
+  consistency without mounting anything). No live profile, link, or server is
+  changed by any of these steps — the profile's **default preset is Standard**,
+  so Standard sessions get none of this: select **Guarded** when creating a
+  session.
 
 ## Caveats
 
