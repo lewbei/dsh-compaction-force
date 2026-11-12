@@ -277,24 +277,31 @@ const SC_AUTHORITY_LINE = 'this checkpoint is the authoritative record of that s
 /**
  * Split one text block into extraction candidates.
  *
- * The plugin's own previously-generated checkpoint sections are skipped so
- * their headings, bullets and footer are never re-counted as user constraints
- * (that previously consumed the cap and dropped genuine new instructions).
+ * The plugin's own previously-generated checkpoint sections are handled so
+ * their headings and footer are never re-counted as user constraints (that
+ * previously consumed the cap and dropped genuine new instructions). The
+ * `## Active Constraints (preserve these)` section is special: its bullets are
+ * GENUINE prior constraints that must be carried forward into the next
+ * checkpoint — otherwise a lossy summarizer erases them on the next compaction.
+ * Context/handoff note sections remain fully skipped.
+ *
  * Lines and paragraphs are split before bounded sentence extraction so a
  * multiline, unpunctuated constraint list is not discarded as one over-long
  * candidate.
+ *
+ * @returns {Array<{ text: string, prior: boolean }>}
  */
 function splitSCCandidates(text, syntheticHeadings) {
   const lines = String(text ?? '').replace(/\r\n?/g, '\n').split('\n')
   const candidates = []
   let paragraph = []
-  let inSynthetic = false
+  let section = 'none' // 'none' | 'synthetic' (context/handoff) | 'prior' (Active Constraints)
   const flushParagraph = () => {
     if (paragraph.length === 0) return
     const joined = paragraph.join(' ')
     for (const sentence of joined.split(/(?<=[.!?])\s+/)) {
       const trimmed = sentence.trim()
-      if (trimmed.length > 0) candidates.push(trimmed)
+      if (trimmed.length > 0) candidates.push({ text: trimmed, prior: section === 'prior' })
     }
     paragraph = []
   }
@@ -307,26 +314,29 @@ function splitSCCandidates(text, syntheticHeadings) {
     const heading = line.match(/^#{1,6}\s+(.*)$/)
     if (heading !== null) {
       flushParagraph()
-      inSynthetic = syntheticHeadings.has(heading[1].replace(/\s+/g, ' ').trim().toLowerCase())
+      const name = heading[1].replace(/\s+/g, ' ').trim().toLowerCase()
+      if (name === SC_SECTION_HEADING.toLowerCase()) section = 'prior'
+      else if (syntheticHeadings.has(name)) section = 'synthetic'
+      else section = 'none'
       continue
     }
-    if (inSynthetic) {
+    if (section === 'synthetic') {
       // Only bullets and blank continuation belong to a generated section;
       // genuine prose appended after the note must not be swallowed.
       if (/^(?:[-*+•]|\d{1,3}[.)])\s+/.test(line) || line.length === 0) continue
-      inSynthetic = false
+      section = 'none'
     }
     const bullet = line.match(/^(?:[-*+•]|\d{1,3}[.)])\s+(.*)$/)
     if (bullet !== null) {
       flushParagraph()
-      candidates.push(bullet[1].trim())
+      candidates.push({ text: bullet[1].trim(), prior: section === 'prior' })
       continue
     }
     // A line that ends a sentence belongs to a flowing paragraph; an
     // unpunctuated line is a standalone fragment (a bare constraint bullet)
     // that must survive on its own.
     if (/[.!?]$/.test(line)) paragraph.push(line)
-    else candidates.push(line)
+    else candidates.push({ text: line, prior: section === 'prior' })
   }
   flushParagraph()
   return candidates
@@ -354,7 +364,25 @@ export function extractSideConstraints(messages, options = {}) {
     String(options.heading ?? DEFAULTS.heading).toLowerCase(),
   ])
   const seen = new Set()
-  const out = []
+  const fresh = []
+  const prior = []
+  const stage = (candidate, fromPrior) => {
+    if (candidate.length < 8) return
+    if (candidate.endsWith('?')) return
+    const lower = candidate.toLowerCase()
+    if (lower === SC_FOOTER || lower.includes(SC_FOOTER)) return
+    if (lower === SC_AUTHORITY_LINE || lower.includes(SC_AUTHORITY_LINE)) return
+    // Match against the full text; store a truncated copy for over-long
+    // single-line candidates instead of dropping them.
+    if (!constraintRe.test(candidate)) return
+    const display = candidate.length > 400 ? `${candidate.slice(0, 397)}...` : candidate
+    // Dedup ignoring trailing punctuation ("Never deploy." ≡ "never deploy!").
+    const key = lower.replace(/[!?.,;:]+$/g, '')
+    if (seen.has(key)) return
+    seen.add(key)
+    const item = display.length > 240 ? `${display.slice(0, 237)}...` : display
+    ;(fromPrior ? prior : fresh).push(item)
+  }
   // Scan newest messages first so the 8-slot cap keeps the freshest constraints
   // (the ones most likely to still bind), instead of silently dropping them.
   const list = Array.isArray(messages) ? messages : []
@@ -365,25 +393,18 @@ export function extractSideConstraints(messages, options = {}) {
     const content = Array.isArray(msg.content) ? msg.content : (typeof msg.content === 'string' ? [{ type: 'text', text: msg.content }] : [])
     for (const block of content) {
       if (block === null || typeof block !== 'object' || typeof block.text !== 'string') continue
-      for (const raw of splitSCCandidates(block.text, syntheticHeadings)) {
-        const candidate = raw.replace(/\s+/g, ' ').trim()
-        if (candidate.length < 8) continue
-        if (candidate.endsWith('?')) continue
-        const lower = candidate.toLowerCase()
-        if (lower === SC_FOOTER || lower.includes(SC_FOOTER)) continue
-        if (lower === SC_AUTHORITY_LINE || lower.includes(SC_AUTHORITY_LINE)) continue
-        // Match against the full text; store a truncated copy for over-long
-        // single-line candidates instead of dropping them.
-        if (!constraintRe.test(candidate)) continue
-        const display = candidate.length > 400 ? `${candidate.slice(0, 397)}...` : candidate
-        // Dedup ignoring trailing punctuation ("Never deploy." ≡ "never deploy!").
-        const key = lower.replace(/[!?.,;:]+$/g, '')
-        if (seen.has(key)) continue
-        seen.add(key)
-        out.push(display.length > 240 ? `${display.slice(0, 237)}...` : display)
-        if (out.length >= 8) return out
+      for (const { text, prior: fromPrior } of splitSCCandidates(block.text, syntheticHeadings)) {
+        stage(text.replace(/\s+/g, ' ').trim(), fromPrior)
       }
     }
+  }
+  // New/fresh constraints win the cap; prior constraints from the previous
+  // checkpoint are carried forward into the remaining slots so a lossy
+  // summarizer cannot erase them across compactions.
+  const out = fresh.slice(0, 8)
+  for (const item of prior) {
+    if (out.length >= 8) break
+    out.push(item)
   }
   return out
 }
