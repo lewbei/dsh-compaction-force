@@ -19,9 +19,47 @@
  *   intact retention — fraction found whose normalized wording is unchanged
  *                      (verbatim), i.e. not garbled or merged with other text.
  *
- * Run: node benchmarks/compint-run/retention-bench.mjs
+ * Run: node benchmarks/compint-run/retention-bench.mjs            (quick, default)
+ *      node benchmarks/compint-run/retention-bench.mjs --full      (large run)
+ *      node benchmarks/compint-run/retention-bench.mjs \
+ *        --instances 100 --seeds 101,202,303 --constraints 8 --generations 3
+ * Options:
+ *   --instances N    scenarios per seed per arm (default 10)
+ *   --seeds a,b,c    comma-separated deterministic seeds (default 20261112)
+ *   --constraints K  constraints per scenario (default 6)
+ *   --generations G  repeated-compaction generations to test (default 2)
+ *   --arms a,b,c     arms to run (default off,context,handoff,both)
+ *   --full           shorthand for --instances 100 --seeds 101,202,303
+ *                    --constraints 8 --generations 3
  */
 import { buildNoteText, extractSideConstraints } from '../../index.js'
+
+// ---------------------------------------------------------------------------
+// CLI parsing (kept dependency-free)
+// ---------------------------------------------------------------------------
+function parseArgs(argv) {
+  const get = (name, fallback) => {
+    const index = argv.indexOf(name)
+    return index === -1 ? fallback : argv[index + 1]
+  }
+  let instances = Number(get('--instances', 10))
+  let seeds = get('--seeds', '20261112').split(',').map((value) => Number(value.trim())).filter(Number.isFinite)
+  let constraints = Number(get('--constraints', 6))
+  let generations = Number(get('--generations', 2))
+  let arms = get('--arms', 'off,context,handoff,both').split(',').map((value) => value.trim()).filter(Boolean)
+  if (argv.includes('--full')) {
+    instances = 100
+    seeds = [101, 202, 303]
+    constraints = 8
+    generations = 3
+    arms = ['off', 'context', 'handoff', 'both']
+  }
+  if (!Number.isInteger(instances) || instances <= 0) instances = 10
+  if (!Number.isInteger(constraints) || constraints <= 0) constraints = 6
+  if (!Number.isInteger(generations) || generations <= 0) generations = 2
+  if (seeds.length === 0) seeds = [20261112]
+  return { instances, seeds, constraints, generations, arms }
+}
 
 // ---------------------------------------------------------------------------
 // Deterministic RNG (mulberry32) so the benchmark is reproducible.
@@ -149,60 +187,91 @@ function constraintScore(checkpoint, constraints) {
 // ---------------------------------------------------------------------------
 // Benchmark driver
 // ---------------------------------------------------------------------------
-const SEED = 20261112
-const INSTANCES = 10
-const CONSTRAINTS_PER_SCENARIO = 6
-const ARMS = ['off', 'context', 'handoff', 'both']
-
-function run() {
-  const random = mulberry32(SEED)
-  const scenarios = Array.from({ length: INSTANCES }, () => makeConversation(random, CONSTRAINTS_PER_SCENARIO))
-  const results = {}
-  for (const arm of ARMS) {
-    let found = 0
-    let intact = 0
-    let total = 0
-    for (const scenario of scenarios) {
-      const checkpoint = assembleCheckpoint(scenario, arm)
-      const { found: f, intact: i } = constraintScore(checkpoint, scenario.constraints)
-      found += f
-      intact += i
-      total += scenario.constraints.length
-    }
-    results[arm] = {
-      retention: found / total,
-      intactRetention: intact / total,
-      found,
-      intact,
-      total,
+function run(cfg) {
+  const { instances, constraints, seeds, arms } = cfg
+  const perSeed = {}
+  const totals = {}
+  for (const arm of arms) totals[arm] = { found: 0, intact: 0, total: 0 }
+  for (const seed of seeds) {
+    const random = mulberry32(seed)
+    perSeed[seed] = {}
+    for (const arm of arms) {
+      const scenarios = Array.from({ length: instances }, () => makeConversation(random, constraints))
+      let found = 0
+      let intact = 0
+      let total = 0
+      for (const scenario of scenarios) {
+        const checkpoint = assembleCheckpoint(scenario, arm)
+        const { found: f, intact: i } = constraintScore(checkpoint, scenario.constraints)
+        found += f
+        intact += i
+        total += scenario.constraints.length
+      }
+      perSeed[seed][arm] = { retention: found / total, intactRetention: intact / total }
+      totals[arm].found += found
+      totals[arm].intact += intact
+      totals[arm].total += total
     }
   }
-  return results
+  const aggregate = {}
+  for (const arm of arms) {
+    const per = seeds.map((seed) => perSeed[seed][arm])
+    const retention = per.map((entry) => entry.retention)
+    const intact = per.map((entry) => entry.intactRetention)
+    aggregate[arm] = {
+      retention: totals[arm].found / totals[arm].total,
+      intactRetention: totals[arm].intact / totals[arm].total,
+      retentionMin: Math.min(...retention),
+      retentionMax: Math.max(...retention),
+      intactMin: Math.min(...intact),
+      intactMax: Math.max(...intact),
+      found: totals[arm].found,
+      intact: totals[arm].intact,
+      total: totals[arm].total,
+    }
+  }
+  return { aggregate, perSeed }
 }
 
 // ---------------------------------------------------------------------------
-// Repeated-compaction experiment: a second compaction sees the first
-// checkpoint as a framed replacement user message, plus one new instruction.
+// Repeated-compaction experiment: each generation sees the previous checkpoint
+// as a framed replacement user message plus one new instruction.
 // ---------------------------------------------------------------------------
-function runRepeated(arm = 'handoff') {
-  const random = mulberry32(SEED ^ 0x5F3759DF)
-  let priorSurvived = 0
+function runRepeated(arm, cfg) {
+  const { instances, constraints, generations, seeds } = cfg
+  let priorAllSurvived = 0
+  let priorFound = 0
+  let priorTotal = 0
   let newSurvived = 0
-  const total = INSTANCES
-  for (let i = 0; i < INSTANCES; i += 1) {
-    const scenario = makeConversation(random, CONSTRAINTS_PER_SCENARIO)
-    const first = assembleCheckpoint(scenario, arm)
-    const newInstruction = 'Never deploy on weekends without a reviewer present.'
-    const secondRoundMessages = [
-      { role: 'user', content: [{ type: 'text', text: first.full }] },
-      { role: 'user', content: [{ type: 'text', text: newInstruction }] },
-    ]
-    const second = assembleCheckpoint({ messages: secondRoundMessages }, arm)
-    const oldScore = constraintScore(second, scenario.constraints)
-    if (oldScore.found === scenario.constraints.length) priorSurvived += 1
-    if (constraintScore(second, [newInstruction]).found === 1) newSurvived += 1
+  let newTotal = 0
+  let total = 0
+  for (const seed of seeds) {
+    const random = mulberry32(seed ^ 0x5F3759DF)
+    for (let i = 0; i < instances; i += 1) {
+      const scenario = makeConversation(random, constraints)
+      let checkpoint = assembleCheckpoint(scenario, arm)
+      const addedInstructions = []
+      for (let g = 2; g <= generations; g += 1) {
+        const instruction = `Always wait for approval before step ${g} of this task.`
+        addedInstructions.push(instruction)
+        checkpoint = assembleCheckpoint({
+          messages: [
+            { role: 'user', content: [{ type: 'text', text: checkpoint.full }] },
+            { role: 'user', content: [{ type: 'text', text: instruction }] },
+          ],
+        }, arm)
+      }
+      const oldScore = constraintScore(checkpoint, scenario.constraints)
+      if (oldScore.found === scenario.constraints.length) priorAllSurvived += 1
+      priorFound += oldScore.found
+      priorTotal += scenario.constraints.length
+      const newOk = addedInstructions.filter((instruction) => constraintScore(checkpoint, [instruction]).found === 1).length
+      newSurvived += newOk
+      newTotal += addedInstructions.length
+      total += 1
+    }
   }
-  return { priorSurvived, newSurvived, total }
+  return { priorAllSurvived, priorFound, priorTotal, newSurvived, newTotal, total }
 }
 
 // ---------------------------------------------------------------------------
@@ -210,27 +279,38 @@ function runRepeated(arm = 'handoff') {
 // ---------------------------------------------------------------------------
 const pct = (value) => `${(value * 100).toFixed(0)} %`
 
-const results = run()
+const cfg = parseArgs(process.argv.slice(2))
+const { aggregate, perSeed } = run(cfg)
+const repeated = {}
+for (const arm of cfg.arms) repeated[arm] = runRepeated(arm, cfg)
 
 console.log('CompInt-style side-constraint retention benchmark')
-console.log(`seed=${SEED} instances=${INSTANCES} constraints/scenario=${CONSTRAINTS_PER_SCENARIO} arms=${ARMS.join(',')}`)
+console.log(`seeds=${cfg.seeds.join(',')} instances/seed=${cfg.instances} constraints/scenario=${cfg.constraints} generations=${cfg.generations} arms=${cfg.arms.join(',')}`)
 console.log('simulated task-centric summarizer drops instructions; real extractSideConstraints + buildNoteText used')
 console.log('')
 console.log('| Arm | Retention | Intact retention | found/total |')
 console.log('|---|---:|---:|---:|')
-for (const arm of ARMS) {
-  const r = results[arm]
-  console.log(`| ${arm} | ${pct(r.retention)} | ${pct(r.intactRetention)} | ${r.found}/${r.total} |`)
+for (const arm of cfg.arms) {
+  const r = aggregate[arm]
+  const spread = cfg.seeds.length > 1
+    ? ` (${pct(r.retentionMin)}–${pct(r.retentionMax)} across seeds)`
+    : ''
+  const spreadIntact = cfg.seeds.length > 1
+    ? ` (${pct(r.intactMin)}–${pct(r.intactMax)})`
+    : ''
+  console.log(`| ${arm} | ${pct(r.retention)}${spread} | ${pct(r.intactRetention)}${spreadIntact} | ${r.found}/${r.total} |`)
 }
 console.log('')
 console.log('Metric definitions: retention = fraction of original constraints found (normalized) in the')
 console.log('final checkpoint; intact retention = fraction found with unchanged normalized wording.')
 console.log('')
-
-const repeated = runRepeated('handoff')
-console.log('Repeated-compaction experiment (handoff arm):')
-console.log(`- prior constraints surviving a second compaction: ${repeated.priorSurvived}/${repeated.total} scenarios`)
-console.log(`- a new instruction added before the second compaction surviving it: ${repeated.newSurvived}/${repeated.total}`)
+console.log(`Repeated-compaction experiment (${cfg.generations} generations):`)
+for (const arm of cfg.arms) {
+  const r = repeated[arm]
+  console.log(`- ${arm}: all prior constraints surviving every generation: ${r.priorAllSurvived}/${r.total} scenarios;`)
+  console.log(`  per-constraint prior survival: ${r.priorFound}/${r.priorTotal} (${pct(r.priorFound / r.priorTotal)});`)
+  console.log(`  instructions added across generations surviving: ${r.newSurvived}/${r.newTotal}`)
+}
 console.log('')
 console.log('LIMIT: local simulation, no LLM, no live profile; not a reproduction of the external')
 console.log('hype/dsh-compaction-ab/ harness numbers.')
