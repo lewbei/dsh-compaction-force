@@ -50,18 +50,21 @@ const CATALOG_TTL_MS = 5 * 60 * 1000
 /** Cached provider/model catalog per llm service, with an in-flight promise. */
 const catalogCache = new WeakMap()
 
+/** Accept a positive integer, or a numeric string (e.g. YAML `"1000"`). */
+const toPositiveInt = (value, fallback) => {
+  let parsed = value
+  if (typeof parsed === 'string' && parsed.trim() !== '') parsed = Number(parsed)
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback
+}
+
 /** Normalize one row config into a complete, validated option set. */
 export function normalizeOptions(config = {}) {
-  const forceAtTokens = Number.isInteger(config?.forceAtTokens) && config.forceAtTokens > 0
-    ? config.forceAtTokens
-    : DEFAULTS.forceAtTokens
-  const minContextWindow = Number.isInteger(config?.minContextWindow) && config.minContextWindow > 0
-    ? config.minContextWindow
-    : DEFAULTS.minContextWindow
+  const forceAtTokens = toPositiveInt(config?.forceAtTokens, DEFAULTS.forceAtTokens)
+  const minContextWindow = toPositiveInt(config?.minContextWindow, DEFAULTS.minContextWindow)
   const note = NOTE_VARIANTS.has(config?.note) ? config.note : DEFAULTS.note
-  const heading = typeof config?.heading === 'string' && config.heading.trim().length > 0
-    ? config.heading.replace(/[\r\n<>]+/g, ' ').replace(/\s+/g, ' ').trim()
-    : DEFAULTS.heading
+  const rawHeading = typeof config?.heading === 'string' ? config.heading : ''
+  const sanitizedHeading = rawHeading.replace(/[\r\n<>]+/g, ' ').replace(/\s+/g, ' ').trim()
+  const heading = sanitizedHeading.length > 0 ? sanitizedHeading : DEFAULTS.heading
   const scExtract = ['off', 'pattern'].includes(config?.scExtract) ? config.scExtract : DEFAULTS.scExtract
   return { forceAtTokens, minContextWindow, note, heading, scExtract }
 }
@@ -89,12 +92,8 @@ const validRetention = (thresholdRatio) => {
  * @returns {{ provider: string, model: string, thresholdRatio: number, retainRatio?: number, retainTokens?: number }[]}
  */
 export function buildPolicies(models, options = {}, context = {}) {
-  const forceAtTokens = Number.isInteger(options.forceAtTokens) && options.forceAtTokens > 0
-    ? options.forceAtTokens
-    : DEFAULTS.forceAtTokens
-  const minContextWindow = Number.isInteger(options.minContextWindow) && options.minContextWindow > 0
-    ? options.minContextWindow
-    : DEFAULTS.minContextWindow
+  const forceAtTokens = toPositiveInt(options.forceAtTokens, DEFAULTS.forceAtTokens)
+  const minContextWindow = toPositiveInt(options.minContextWindow, DEFAULTS.minContextWindow)
   const previousRows = context.previousRows instanceof Map
     ? context.previousRows
     : new Map(Array.isArray(context.previousRows) ? context.previousRows.map((row) => [policyKey(row), row]) : [])
@@ -349,7 +348,11 @@ export function extractSideConstraints(messages, options = {}) {
   ])
   const seen = new Set()
   const out = []
-  for (const msg of Array.isArray(messages) ? messages : []) {
+  // Scan newest messages first so the 8-slot cap keeps the freshest constraints
+  // (the ones most likely to still bind), instead of silently dropping them.
+  const list = Array.isArray(messages) ? messages : []
+  for (let index = list.length - 1; index >= 0; index -= 1) {
+    const msg = list[index]
     if (msg === null || typeof msg !== 'object') continue
     if (msg.role !== 'user') continue
     const content = Array.isArray(msg.content) ? msg.content : (typeof msg.content === 'string' ? [{ type: 'text', text: msg.content }] : [])
@@ -357,16 +360,20 @@ export function extractSideConstraints(messages, options = {}) {
       if (block === null || typeof block !== 'object' || typeof block.text !== 'string') continue
       for (const raw of splitSCCandidates(block.text, syntheticHeadings)) {
         const candidate = raw.replace(/\s+/g, ' ').trim()
-        if (candidate.length < 8 || candidate.length > 400) continue
+        if (candidate.length < 8) continue
+        if (candidate.endsWith('?')) continue
         const lower = candidate.toLowerCase()
         if (lower === SC_FOOTER || lower.includes(SC_FOOTER)) continue
         if (lower === SC_AUTHORITY_LINE || lower.includes(SC_AUTHORITY_LINE)) continue
+        // Match against the full text; store a truncated copy for over-long
+        // single-line candidates instead of dropping them.
         if (!constraintRe.test(candidate)) continue
-        // Skip the probe/question itself (ends with ?) — those are tests, not constraints.
-        if (candidate.endsWith('?')) continue
-        if (seen.has(lower)) continue
-        seen.add(lower)
-        out.push(candidate.length > 240 ? `${candidate.slice(0, 237)}...` : candidate)
+        const display = candidate.length > 400 ? `${candidate.slice(0, 397)}...` : candidate
+        // Dedup ignoring trailing punctuation ("Never deploy." ≡ "never deploy!").
+        const key = lower.replace(/[!?.,;:]+$/g, '')
+        if (seen.has(key)) continue
+        seen.add(key)
+        out.push(display.length > 240 ? `${display.slice(0, 237)}...` : display)
         if (out.length >= 8) return out
       }
     }
@@ -391,7 +398,10 @@ export function buildNoteText({ variant, heading = DEFAULTS.heading, summaryText
   }
   if (Array.isArray(sideConstraints) && sideConstraints.length > 0) {
     const scLines = ['## Active Constraints (preserve these)']
-    for (const sc of sideConstraints) scLines.push(`- ${sc}`)
+    for (const sc of sideConstraints) {
+      // Sanitize so a constraint cannot inject extra markdown/newlines into the note.
+      scLines.push(`- ${String(sc).replace(/\s+/g, ' ').trim()}`)
+    }
     scLines.push('- These are user-issued side constraints for this session; they MUST survive every compaction.')
     parts.push(scLines.join('\n'))
   }

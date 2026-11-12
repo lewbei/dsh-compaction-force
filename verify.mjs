@@ -556,6 +556,59 @@ await test('extractSideConstraints: custom handoff heading is also skipped', () 
   assert.equal(extracted.length, 0, 'the configured handoff section must not leak constraint-looking bullets')
 })
 
+await test('extractSideConstraints: the cap keeps the newest constraints', () => {
+  const oldest = Array.from({ length: 8 }, (_, i) => `Never do action ${i + 1} outside the workspace.`)
+  const newest = 'Never deploy to production on Fridays.'
+  const extracted = extractSideConstraints([
+    { role: 'user', content: [{ type: 'text', text: oldest.join(' ') }] },
+    { role: 'user', content: [{ type: 'text', text: newest }] },
+  ])
+  assert.equal(extracted.length, 8)
+  assert.ok(extracted.includes(newest), 'freshest constraint must survive the cap')
+  assert.ok(!extracted.includes(oldest[7]), 'the oldest message should yield its last slot')
+})
+
+await test('extractSideConstraints: an over-long single-line bullet is truncated, not dropped', () => {
+  const long = ('Never deploy a change that has not been reviewed by at least two independent reviewers and validated end to end in staging before it reaches the production fleet, since a single unverified deploy can corrupt user data for hours. ').repeat(3).trim()
+  assert.ok(long.length > 400)
+  const extracted = extractSideConstraints([{ role: 'user', content: [{ type: 'text', text: long }] }])
+  assert.equal(extracted.length, 1)
+  assert.ok(extracted[0].startsWith('Never deploy a change'))
+  assert.ok(extracted[0].length <= 240 || extracted[0].endsWith('...'))
+})
+
+await test('normalizeOptions: numeric strings are coerced, not silently ignored', () => {
+  assert.equal(normalizeOptions({ forceAtTokens: '1000', minContextWindow: '2000' }).forceAtTokens, 1000)
+  assert.equal(normalizeOptions({ forceAtTokens: '1000', minContextWindow: '2000' }).minContextWindow, 2000)
+  assert.equal(normalizeOptions({ forceAtTokens: 'not-a-number' }).forceAtTokens, DEFAULTS.forceAtTokens)
+  assert.equal(normalizeOptions({ forceAtTokens: '' }).forceAtTokens, DEFAULTS.forceAtTokens)
+})
+
+await test('buildPolicies: numeric string forceAtTokens is honored', () => {
+  const policies = buildPolicies(
+    [{ provider: 'p', model: 'm', contextWindow: 1000000 }],
+    { forceAtTokens: '1000', minContextWindow: '500000' },
+  )
+  assert.equal(policies[0].thresholdRatio, 0.001)
+})
+
+await test('normalizeOptions: heading that sanitizes to empty falls back to the default', () => {
+  assert.equal(normalizeOptions({ heading: '<>' }).heading, DEFAULTS.heading)
+  assert.equal(normalizeOptions({ heading: '<>\n' }).heading, DEFAULTS.heading)
+  assert.equal(normalizeOptions({ heading: 'Real Heading' }).heading, 'Real Heading')
+})
+
+await test('extractSideConstraints: de-duplication ignores trailing punctuation', () => {
+  const extracted = extractSideConstraints([{ role: 'user', content: [{ type: 'text', text: 'Never deploy. never deploy! Never deploy?' }] }])
+  assert.equal(extracted.length, 1)
+})
+
+await test('buildNoteText: sanitizes constraints so injected markdown cannot escape', () => {
+  const text = buildNoteText({ variant: 'handoff', summaryText: '## Current Work\n- work', sideConstraints: ['Never deploy.\n## Injected heading'] })
+  assert.match(text, /- Never deploy\. ## Injected heading/)
+  assert.doesNotMatch(text, /## Injected heading\s*$/)
+})
+
 await test('plugin module has the expected name', async () => {
   const module = await import('./index.js')
   assert.equal(module.name, 'compaction-force')
