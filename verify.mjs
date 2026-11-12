@@ -116,7 +116,7 @@ const fakeCtx = (services) => ({
   },
   inject(names, callback) {
     this.names = names
-    callback(services)
+    callback({ ...services, effect: (setup) => setup() })
   },
 })
 

@@ -31,6 +31,8 @@
  * `engine.summarize`; shipped packages are never modified.
  */
 
+import { isDeepStrictEqual } from 'node:util'
+
 export const name = 'compaction-force'
 
 export const DEFAULTS = Object.freeze({
@@ -167,17 +169,19 @@ export function catalogFor(llm) {
  * The engine object itself is not frozen; `engine.config` is a frozen value
  * but the property is writable, so a new frozen config replaces it atomically.
  */
-export async function installPolicies(engine, llm, options = {}) {
+export async function installPolicies(engine, llm, options = {}, commit) {
   if (engine === null || typeof engine !== 'object') return 0
   const models = await catalogFor(llm)
   const policies = buildPolicies(models, options)
   if (policies.length === 0) return 0
   try {
-    const existing = Array.isArray(engine.config?.modelPolicies) ? engine.config.modelPolicies : []
+    const previous = engine.config
+    const existing = Array.isArray(previous?.modelPolicies) ? previous.modelPolicies : []
     const merged = new Map(existing.map((policy) => [`${policy.provider}\u0000${policy.model}`, policy]))
     for (const policy of policies) merged.set(`${policy.provider}\u0000${policy.model}`, policy)
-    const next = Object.freeze({ ...engine.config, modelPolicies: [...merged.values()] })
-    engine.config = next
+    const next = Object.freeze({ ...previous, modelPolicies: [...merged.values()] })
+    if (commit === undefined) engine.config = next
+    else if (!commit(previous, next, policies)) return 0
     return policies.length
   } catch {
     return 0
@@ -294,40 +298,82 @@ function measureTokens(ctx, agent) {
 }
 
 /** Wrap one engine's public summarize; appended note blocks land inside the checkpoint. */
-export function wrapSummarize(engine, ctx, options = {}) {
-  if (engine === null || typeof engine !== 'object') return false
-  if (engine[WRAPPED] === true) return false
+function mountSummary(engine, ctx, options = {}) {
+  if (engine === null || typeof engine !== 'object' || engine[WRAPPED]) return null
   const original = engine.summarize
-  if (typeof original !== 'function') return false
+  if (typeof original !== 'function') return null
+  const descriptor = Object.getOwnPropertyDescriptor(engine, 'summarize')
+  const markerDescriptor = Object.getOwnPropertyDescriptor(engine, WRAPPED)
+  const token = {}
+  let active = true
   const variant = options.note
   const heading = options.heading ?? DEFAULTS.heading
-  const scExtract = options.scExtract ?? DEFAULTS.scExtract
-  try {
-    engine.summarize = async function summarize(input, agent, signal) {
-      const result = await original.call(this, input, agent, signal)
-      if (variant === 'off' || result === null || typeof result !== 'object' || !Array.isArray(result.summary)) return result
-      const summaryText = result.summary
-        .map((block) => (block !== null && typeof block === 'object' && typeof block.text === 'string' ? block.text : ''))
-        .join('\n')
-      const sideConstraints = options.scExtract === 'pattern'
-        ? extractSideConstraints(Array.isArray(input?.messages) ? input.messages : [])
-        : []
-      const text = buildNoteText({
-        variant,
-        heading,
-        summaryText,
-        totalTokens: measureTokens(ctx, agent),
-        timestamp: new Date().toISOString(),
-        sideConstraints,
-      })
-      if (text.length === 0) return result
-      return { ...result, summary: [...result.summary, { type: 'text', text }] }
-    }
-    engine[WRAPPED] = true
-    return true
-  } catch {
-    return false
+  const summarize = async function (input, agent, signal) {
+    const result = await original.call(this, input, agent, signal)
+    if (!active || variant === 'off' || result === null || typeof result !== 'object' || !Array.isArray(result.summary)) return result
+    const summaryText = result.summary
+      .map((block) => (block !== null && typeof block === 'object' && typeof block.text === 'string' ? block.text : ''))
+      .join('\n')
+    const sideConstraints = options.scExtract === 'pattern'
+      ? extractSideConstraints(Array.isArray(input?.messages) ? input.messages : [])
+      : []
+    const text = buildNoteText({
+      variant,
+      heading,
+      summaryText,
+      totalTokens: measureTokens(ctx, agent),
+      timestamp: new Date().toISOString(),
+      sideConstraints,
+    })
+    if (text.length === 0) return result
+    return { ...result, summary: [...result.summary, { type: 'text', text }] }
   }
+  const dispose = () => {
+    active = false
+    try {
+      if (Object.getOwnPropertyDescriptor(engine, 'summarize')?.value === summarize) {
+        if (descriptor) Object.defineProperty(engine, 'summarize', descriptor)
+        else delete engine.summarize
+      }
+    } finally {
+      if (engine[WRAPPED] === token) {
+        if (markerDescriptor) Object.defineProperty(engine, WRAPPED, markerDescriptor)
+        else delete engine[WRAPPED]
+      }
+    }
+  }
+  try {
+    engine.summarize = summarize
+    engine[WRAPPED] = token
+    return dispose
+  } catch {
+    dispose()
+    return null
+  }
+}
+
+export function wrapSummarize(engine, ctx, options = {}) {
+  return mountSummary(engine, ctx, options) !== null
+}
+
+const policyKey = policy => `${policy.provider}\u0000${policy.model}`
+
+function restorePolicies(engine, receipt) {
+  const current = engine.config
+  if (!Array.isArray(current?.modelPolicies)) return
+  let changed = false
+  const restored = current.modelPolicies.flatMap(policy => {
+    const owned = receipt.rows.get(policyKey(policy))
+    if (!owned || policy !== owned.installed || !isDeepStrictEqual(policy, owned.snapshot)) return [policy]
+    changed = true
+    return owned.previous === undefined ? [] : [owned.previous]
+  })
+  if (!changed) return
+  const previousRows = receipt.previous?.modelPolicies ?? []
+  const matchesPrevious = restored.length === previousRows.length && restored.every((row, index) => row === previousRows[index])
+  engine.config = current === receipt.next && matchesPrevious
+    ? receipt.previous
+    : Object.freeze({ ...current, modelPolicies: restored })
 }
 
 /**
@@ -355,26 +401,60 @@ export function apply(ctx, config = {}) {
     const engine = scope?.compaction
     const llm = scope?.llm
     if (engine === undefined || engine === null || typeof engine !== 'object') return
-    // `scope` carries tokenMeter; the note's token count comes from it.
-    if (wrapSummarize(engine, scope, options)) {
-      // The catalog is enumerated asynchronously. Log the activation so a
-      // post-restart operator can tell "installed 94 policies" from "installed
-      // none"; retry twice when the boot catalog was still empty (the llm
-      // adapters of the web profile register slightly after the service).
+    scope.effect(() => {
+      const disposeSummary = mountSummary(engine, scope, options)
+      if (disposeSummary === null) return
+      let active = true
+      const timers = new Set()
+      const receipts = []
+      const commit = (previous, next, policies) => {
+        const previousRows = new Map((previous?.modelPolicies ?? []).map(row => [policyKey(row), row]))
+        const receipt = {
+          previous,
+          next,
+          rows: new Map(policies.map(row => [policyKey(row), {
+            previous: previousRows.get(policyKey(row)), installed: row, snapshot: { ...row },
+          }])),
+        }
+        if (!active) return false
+        engine.config = next
+        receipts.push(receipt)
+        return true
+      }
       const install = async (attempt) => {
-        const installed = await installPolicies(engine, llm, options)
-        if (installed > 0) {
-          log('info', `compaction-force: installed ${installed} model policies (forceAtTokens=${options.forceAtTokens}, minContextWindow=${options.minContextWindow})`)
-          return
+        if (!active) return
+        try {
+          const installed = await installPolicies(engine, llm, options, commit)
+          if (!active) return
+          if (installed > 0) {
+            log('info', `compaction-force: installed ${installed} model policies (forceAtTokens=${options.forceAtTokens}, minContextWindow=${options.minContextWindow})`)
+            return
+          }
+          if (attempt < 2) {
+            catalogCache.delete(llm)
+            const timer = globalThis.setTimeout(() => {
+              timers.delete(timer)
+              void install(attempt + 1)
+            }, attempt === 0 ? 500 : 2000)
+            timers.add(timer)
+            return
+          }
+          log('warn', `compaction-force: no model policies installed (empty catalog or no window > ${options.minContextWindow}); compaction keeps the shipped threshold`)
+        } catch (error) {
+          if (active) log('warn', `compaction-force: policy installation failed: ${error instanceof Error ? error.message : String(error)}`)
         }
-        if (attempt < 2) {
-          catalogCache.delete(llm)
-          globalThis.setTimeout?.(() => void install(attempt + 1), attempt === 0 ? 500 : 2000)
-          return
-        }
-        log('warn', `compaction-force: no model policies installed (empty catalog or no window > ${options.minContextWindow}); compaction keeps the shipped threshold`)
       }
       void install(0)
-    }
+      return () => {
+        active = false
+        for (const timer of timers) globalThis.clearTimeout(timer)
+        timers.clear()
+        try {
+          disposeSummary()
+        } finally {
+          for (const receipt of receipts.reverse()) restorePolicies(engine, receipt)
+        }
+      }
+    })
   })
 }
