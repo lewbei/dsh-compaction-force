@@ -404,6 +404,77 @@ await test('buildNoteText: no Active Constraints section when none extracted', (
   assert.doesNotMatch(text, /Active Constraints/)
 })
 
+await test('buildPolicies: resolves customized retention instead of assuming the default 0.16', () => {
+  const models = [{ provider: 'p', model: 'm', contextWindow: 1000000 }]
+  // A service-level retainRatio of 0.3 is valid alone but >= the forced
+  // 0.262144 threshold; the generated row must carry a valid explicit retention.
+  const policies = buildPolicies(models, { forceAtTokens: 262144, minContextWindow: 500000 }, {
+    serviceConfig: { retainRatio: 0.3 },
+  })
+  assert.equal(policies.length, 1)
+  assert.equal(policies[0].thresholdRatio, 0.262144)
+  assert.equal(policies[0].retainRatio, 0.131072)
+  assert.ok(policies[0].retainRatio > 0 && policies[0].retainRatio < policies[0].thresholdRatio)
+})
+
+await test('buildPolicies: a valid inherited ratio stays lean; an invalid one is overridden', () => {
+  const models = [{ provider: 'p', model: 'm', contextWindow: 1000000 }]
+  const lean = buildPolicies(models, { forceAtTokens: 262144, minContextWindow: 500000 }, {
+    serviceConfig: { retainRatio: 0.1 },
+  })
+  assert.equal(lean[0].retainRatio, undefined, 'a valid inherited ratio needs no explicit override')
+  const overridden = buildPolicies(models, { forceAtTokens: 262144, minContextWindow: 500000 }, {
+    serviceConfig: { retainRatio: 0.5 },
+  })
+  assert.ok(overridden[0].retainRatio > 0 && overridden[0].retainRatio < 0.262144)
+})
+
+await test('buildPolicies: retainTokens mode keeps a valid tail and shrinks an impossible one', () => {
+  const models = [{ provider: 'p', model: 'm', contextWindow: 1000000 }]
+  const valid = buildPolicies(models, { forceAtTokens: 262144, minContextWindow: 500000 }, {
+    serviceConfig: { retainTokens: 2000 },
+  })
+  assert.equal(valid[0].retainTokens, undefined, 'a valid retained tail needs no override')
+  assert.equal(valid[0].retainRatio, undefined, 'retainTokens mode must not emit retainRatio')
+  const impossible = buildPolicies(models, { forceAtTokens: 262144, minContextWindow: 500000 }, {
+    serviceConfig: { retainTokens: 300000 },
+  })
+  assert.equal(impossible[0].retainTokens, 131072, 'a tail at/above the max threshold tokens must shrink below it')
+})
+
+await test('installPolicies: same-key replacement preserves unrelated per-model fields', async () => {
+  const engine = makeEngine()
+  const existing = {
+    provider: 'test', model: 'scaled',
+    headroomTokens: 12345, maxTokens: 99999,
+    summarizationProvider: 'octo', summarizationModel: 'squid',
+    retainTokens: 2000,
+    thresholdRatio: 0.4,
+  }
+  engine.config = Object.freeze({ ...engine.config, modelPolicies: [existing] })
+  const llm = makeLlm([{ provider: 'test', model: 'scaled', window: 1000000 }])
+  const installed = await installPolicies(engine, llm, { forceAtTokens: 262144, minContextWindow: 500000 })
+  assert.equal(installed, 1)
+  const row = engine.config.modelPolicies[0]
+  assert.equal(row.headroomTokens, 12345)
+  assert.equal(row.maxTokens, 99999)
+  assert.equal(row.summarizationProvider, 'octo')
+  assert.equal(row.summarizationModel, 'squid')
+  assert.equal(row.retainTokens, 2000)
+  assert.equal(row.thresholdRatio, 0.262144)
+  assert.equal(row.retainRatio, undefined, 'tokens mode must not gain a ratio')
+})
+
+await test('installPolicies: same-key merge replaces a now-invalid retention with a valid one', async () => {
+  const engine = makeEngine()
+  engine.config = Object.freeze({ ...engine.config, retainRatio: 0.3, modelPolicies: [] })
+  const llm = makeLlm([{ provider: 'test', model: 'scaled', window: 1000000 }])
+  await installPolicies(engine, llm, { forceAtTokens: 262144, minContextWindow: 500000 })
+  const row = engine.config.modelPolicies[0]
+  assert.equal(row.thresholdRatio, 0.262144)
+  assert.ok(row.retainRatio > 0 && row.retainRatio < row.thresholdRatio)
+})
+
 await test('plugin module has the expected name', async () => {
   const module = await import('./index.js')
   assert.equal(module.name, 'compaction-force')
