@@ -1,0 +1,18 @@
+# Bundle patch for @local/dsh-compaction-force.
+#
+# The row is a bare host plugin mounted by absolute path. It MUST sit inside the
+# compaction isolate group (the `compaction` service is isolated there) — the
+# Guarded preset does exactly that. Applied at a PROFILE ROOT this patch is
+# inert in the web profile (its root compaction-basic row is disabled) and only
+# meaningful in a profile whose root engine exists, e.g. the headless harness.
+#
+# forceAtTokens 262144 / minContextWindow 500000: models above a 500K window
+# get a per-model thresholdRatio = 262144 / contextWindow, i.e. pressure
+# compaction fires at ~256K tokens.
+- insert:
+    - id: compaction-force
+      name: /path/to/dsh-compaction-force/index.js  # <-- update to your clone path
+      config:
+        forceAtTokens: 262144
+        minContextWindow: 500000
+        note: handoff

@@ -1,0 +1,22 @@
+{
+  "name": "@local/dsh-compaction-force",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Forces ~256K pressure compaction on models whose context window exceeds 500K and appends a context note and/or a self-handoff note to the checkpoint.",
+  "exports": {
+    ".": "./index.js"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "README.md",
+    "verify.mjs"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "license": "MIT"
+}
