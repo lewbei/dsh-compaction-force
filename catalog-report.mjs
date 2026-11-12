@@ -18,6 +18,7 @@ import { existsSync, readFileSync, realpathSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { createRequire } from 'node:module'
 import { dirname, join } from 'node:path'
+import { buildPolicies } from './index.js'
 
 const args = process.argv.slice(2)
 const profileFlag = args.indexOf('--profile')
@@ -91,13 +92,18 @@ for (const [provider, route] of Object.entries(piAi?.config?.providers ?? {})) {
   }
 }
 
+// Use the plugin's own policy builder so filtering and retention math stay
+// identical to what installPolicies actually installs.
+const policies = buildPolicies(models, { forceAtTokens, minContextWindow })
+const policyByKey = new Map(policies.map((policy) => [`${policy.provider}\u0000${policy.model}`, policy]))
 const rows = []
 for (const model of models) {
   if (!Number.isInteger(model.contextWindow) || model.contextWindow <= minContextWindow) continue
-  const ratio = Math.round((forceAtTokens / model.contextWindow) * 1e6) / 1e6
+  const policy = policyByKey.get(`${model.provider}\u0000${model.model}`)
+  if (policy === undefined) continue
   const pressureBudget = model.contextWindow - model.maxTokens - HEADROOM
-  const threshold = Math.floor(Math.min(ratio * model.contextWindow, pressureBudget))
-  rows.push({ ...model, ratio, threshold, pct: (100 * threshold) / model.contextWindow })
+  const threshold = Math.floor(Math.min(policy.thresholdRatio * model.contextWindow, pressureBudget))
+  rows.push({ ...model, ratio: policy.thresholdRatio, retention: policy.retainRatio ?? policy.retainTokens ?? null, threshold, pct: (100 * threshold) / model.contextWindow })
 }
 rows.sort((a, b) => a.threshold - b.threshold || a.provider.localeCompare(b.provider))
 
