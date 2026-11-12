@@ -96,7 +96,9 @@ export function buildPolicies(models, options = {}, context = {}) {
   const minContextWindow = toPositiveInt(options.minContextWindow, DEFAULTS.minContextWindow)
   const previousRows = context.previousRows instanceof Map
     ? context.previousRows
-    : new Map(Array.isArray(context.previousRows) ? context.previousRows.map((row) => [policyKey(row), row]) : [])
+    : new Map(Array.isArray(context.previousRows)
+        ? context.previousRows.filter((row) => row !== null && typeof row === 'object').map((row) => [policyKey(row), row])
+        : [])
   const serviceConfig = context.serviceConfig ?? {}
   const seen = new Set()
   const policies = []
@@ -213,7 +215,9 @@ export async function installPolicies(engine, llm, options = {}, commit) {
   if (engine === null || typeof engine !== 'object') return 0
   const models = await catalogFor(llm)
   const previous = engine.config
-  const existing = Array.isArray(previous?.modelPolicies) ? previous.modelPolicies : []
+  // Drop malformed rows (e.g. null entries) instead of aborting installation; a
+  // healthy reinstall replaces the config wholesale and self-heals.
+  const existing = Array.isArray(previous?.modelPolicies) ? previous.modelPolicies.filter((row) => row !== null && typeof row === 'object') : []
   const policies = buildPolicies(models, options, { previousRows: existing, serviceConfig: previous })
   if (policies.length === 0) return 0
   try {
@@ -537,8 +541,10 @@ export function apply(ctx, config = {}) {
     const llm = scope?.llm
     if (engine === undefined || engine === null || typeof engine !== 'object') return
     scope.effect(() => {
-      const disposeSummary = mountSummary(engine, scope, options)
-      if (disposeSummary === null) return
+      // Policy installation is independent of the summary wrapper: a second
+      // instance on the same engine (or an engine whose summarize is not a
+      // function) must still install its policies.
+      const disposeSummary = mountSummary(engine, scope, options) ?? (() => {})
       let active = true
       const timers = new Set()
       const receipts = []
