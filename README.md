@@ -70,7 +70,7 @@ Config: `forceAtTokens` (default 262144), `minContextWindow` (default 500000),
 
 ## Verification
 
-- `node verify.mjs` — 40 assertions covering option normalization, policy
+- `node verify.mjs` — 52 assertions covering option normalization, policy
   math/filtering/retention (including customized and retainTokens retention
   modes and same-key field preservation), catalog caching and error skipping,
   frozen-config replacement + merge, section extraction, both note styles,
