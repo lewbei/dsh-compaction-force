@@ -97,14 +97,16 @@ export function buildPolicies(models, options = {}) {
     if (seen.has(key)) continue
     seen.add(key)
     const thresholdRatio = round6(forceAtTokens / window)
-    if (thresholdRatio >= 0.8) continue
+    if (thresholdRatio <= 0 || thresholdRatio >= 0.8) continue
     const policy = { provider, model, thresholdRatio }
-    // dsh-compaction-basic rejects retain >= threshold. Windows above
-    // ~1.64 M (and scaled A/B runs) make the force target a smaller fraction
-    // than the default retain ratio, so retain half the forced threshold.
-    // `<=` (not `<`) covers the 6-decimal rounding band where the ratio lands
-    // exactly on 0.16 and retain would otherwise equal the threshold.
-    if (thresholdRatio <= 0.16) policy.retainRatio = round6(thresholdRatio / 2)
+    // dsh-compaction-basic requires 0 < retain < threshold. Keep the usual
+    // rounding unless it collapses the gap at a tiny scaled threshold.
+    if (thresholdRatio <= 0.16) {
+      const retainRatio = round6(thresholdRatio / 2)
+      policy.retainRatio = retainRatio > 0 && retainRatio < thresholdRatio
+        ? retainRatio
+        : thresholdRatio / 2
+    }
     policies.push(policy)
   }
   return policies

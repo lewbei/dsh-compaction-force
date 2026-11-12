@@ -342,6 +342,15 @@ await test('buildPolicies: retainRatio at the rounded 0.16 boundary', () => {
   assert.equal(policies[0].retainRatio, 0.08, 'ratio == 0.16 must still carry the halved retain ratio')
 })
 
+await test('buildPolicies: tiny scaled targets keep valid retention or skip a zero threshold', () => {
+  const catalog = (window) => [{ provider: 'p', model: 'scaled', contextWindow: window }]
+  const policies = buildPolicies(catalog(1000000), { forceAtTokens: 1 })
+  assert.equal(policies.length, 1)
+  assert.equal(policies[0].thresholdRatio, 0.000001)
+  assert.ok(policies[0].retainRatio > 0 && policies[0].retainRatio < policies[0].thresholdRatio)
+  assert.deepEqual(buildPolicies(catalog(3000000), { forceAtTokens: 1 }), [])
+})
+
 await test('sectionBullets: CRLF summaries still extract sections', () => {
   const crlf = '## Current Work\r\n- implementing the parser\r\n- writing tests\r\n\r\n## Next Step\r\n- run the suite\r\n'
   assert.deepEqual(sectionBullets(crlf, 'Current Work'), ['implementing the parser', 'writing tests'])
