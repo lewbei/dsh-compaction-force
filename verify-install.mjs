@@ -14,7 +14,7 @@
  */
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -35,11 +35,11 @@ try {
   assert.equal(run.status, 0, `prepare-patch exited ${run.status}: ${run.stderr}`)
   const patch = run.stdout
   assert(!patch.includes('/path/to/dsh-compaction-force/index.js'), 'placeholder must be substituted')
-  assert(patch.includes(`name: ${fixtureModule}`), 'patch must name the absolute fixture module')
+  assert(patch.includes(`name: "${fixtureModule}"`), 'patch must name the absolute fixture module in a quoted scalar')
   assert(patch.includes('id: compaction-force'), 'patch must keep the row id')
   assert(patch.includes('forceAtTokens: 262144'), 'patch must keep the default config')
   const nameLine = patch.split('\n').find((line) => line.trim().startsWith('name:'))
-  const nameValue = nameLine.split('name:')[1].split('#')[0].trim()
+  const nameValue = nameLine.split('name:')[1].split('#')[0].trim().replace(/^"|"$/g, '')
   assert(nameLine && existsSync(nameValue), 'name must resolve to an existing file')
   ok('prepare-patch substitutes a real absolute path and preserves the row structure')
 
@@ -54,6 +54,23 @@ try {
   const missing = spawnSync(node, [join(root, 'scripts/prepare-patch.mjs'), join(fixture, 'nope.js')], { encoding: 'utf8' })
   assert.notEqual(missing.status, 0, 'missing module must be refused')
   ok('prepare-patch refuses a nonexistent module')
+
+  // 3b. refusal of a directory named like a module --------------------------
+  const dirModule = join(fixture, 'dir.js')
+  mkdirSync(dirModule)
+  const dirRun = spawnSync(node, [join(root, 'scripts/prepare-patch.mjs'), dirModule], { encoding: 'utf8' })
+  assert.notEqual(dirRun.status, 0, 'a directory must be refused')
+  ok('prepare-patch refuses a directory posing as a module')
+
+  // 3c. a colon-space path stays a valid quoted scalar ----------------------
+  const colonDir = join(fixture, 'c: d')
+  mkdirSync(colonDir)
+  const colonModule = join(colonDir, 'index.js')
+  writeFileSync(colonModule, 'export const name = "compaction-force"\n')
+  const colonRun = spawnSync(node, [join(root, 'scripts/prepare-patch.mjs'), colonModule], { encoding: 'utf8' })
+  assert.equal(colonRun.status, 0, colonRun.stderr)
+  assert(colonRun.stdout.includes(`name: "${colonModule}"`), 'colon-space path must be emitted as a quoted scalar')
+  ok('prepare-patch quotes a colon-space path')
 
   // 4. template documents the mount rules ---------------------------------
   const template = readFileSync(join(root, 'cordis.patch.yml'), 'utf8')

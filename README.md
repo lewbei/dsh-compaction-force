@@ -159,7 +159,7 @@ A generated patch looks like:
 ```yaml
 - insert:
     - id: compaction-force
-      name: /abs/path/to/dsh-compaction-force/index.js
+      name: "/abs/path/to/dsh-compaction-force/index.js"
       config:
         forceAtTokens: 262144
         minContextWindow: 500000

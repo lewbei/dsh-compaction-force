@@ -16,7 +16,7 @@
  * restart of that profile (see README "Live mounting").
  */
 import { extname, resolve } from 'node:path'
-import { existsSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 
 const PLACEHOLDER = '/path/to/dsh-compaction-force/index.js'
@@ -37,8 +37,8 @@ if (!existsSync(source)) {
   console.error(`prepare-patch: module not found: ${source}`)
   process.exit(1)
 }
-if (extname(source) !== '.js') {
-  console.error(`prepare-patch: expected a .js entry module, got: ${source}`)
+if (extname(source) !== '.js' || !statSync(source).isFile()) {
+  console.error(`prepare-patch: expected a .js entry module file, got: ${source}`)
   process.exit(1)
 }
 
@@ -47,8 +47,11 @@ if (!template.includes(PLACEHOLDER)) {
   console.error(`prepare-patch: template ${templatePath} no longer contains the placeholder ${PLACEHOLDER}`)
   process.exit(1)
 }
-const patch = template.split(PLACEHOLDER).join(source)
-if (!patch.includes(`name: ${source}`) || !patch.includes('id: compaction-force')) {
+// Double-quote the interpolated name: a plain YAML scalar is invalid when the
+// path contains a colon-space (e.g. "c: d/index.js").
+const quotedPath = `"${source.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`
+const patch = template.split(PLACEHOLDER).join(quotedPath)
+if (!patch.includes(`name: ${quotedPath}`) || !patch.includes('id: compaction-force')) {
   console.error('prepare-patch: generated patch is missing the expected row structure')
   process.exit(1)
 }
