@@ -68,20 +68,37 @@ export function normalizeOptions(config = {}) {
 
 const round6 = (value) => Math.round(value * 1e6) / 1e6
 
+/** Shipped retention ratio assumed when a config row or service default omits it. */
+const DEFAULT_RETAIN_RATIO = 0.16
+
+/** Bound an emitted retention so it is strictly below the threshold and positive. */
+const validRetention = (thresholdRatio) => {
+  const halved = round6(thresholdRatio / 2)
+  return halved > 0 && halved < thresholdRatio ? halved : thresholdRatio / 2
+}
+
 /**
  * Build the per-model policies for one catalog.
  *
  * @param {{ provider: string, model: string, contextWindow: number }[]} models
  * @param {{ forceAtTokens?: number, minContextWindow?: number }} [options]
- * @returns {{ provider: string, model: string, thresholdRatio: number, retainRatio?: number }[]}
+ * @param {{ previousRows?: Map<string, object>|object[], serviceConfig?: object }} [context]
+ *   The engine's current rows and config, so generated rows resolve the actual
+ *   retention mode (retainRatio vs retainTokens) and never rely on an inherited
+ *   retention that the new threshold would make invalid.
+ * @returns {{ provider: string, model: string, thresholdRatio: number, retainRatio?: number, retainTokens?: number }[]}
  */
-export function buildPolicies(models, options = {}) {
+export function buildPolicies(models, options = {}, context = {}) {
   const forceAtTokens = Number.isInteger(options.forceAtTokens) && options.forceAtTokens > 0
     ? options.forceAtTokens
     : DEFAULTS.forceAtTokens
   const minContextWindow = Number.isInteger(options.minContextWindow) && options.minContextWindow > 0
     ? options.minContextWindow
     : DEFAULTS.minContextWindow
+  const previousRows = context.previousRows instanceof Map
+    ? context.previousRows
+    : new Map(Array.isArray(context.previousRows) ? context.previousRows.map((row) => [policyKey(row), row]) : [])
+  const serviceConfig = context.serviceConfig ?? {}
   const seen = new Set()
   const policies = []
   for (const entry of Array.isArray(models) ? models : []) {
@@ -101,13 +118,37 @@ export function buildPolicies(models, options = {}) {
     const thresholdRatio = round6(forceAtTokens / window)
     if (thresholdRatio <= 0 || thresholdRatio >= 0.8) continue
     const policy = { provider, model, thresholdRatio }
-    // dsh-compaction-basic requires 0 < retain < threshold. Keep the usual
-    // rounding unless it collapses the gap at a tiny scaled threshold.
-    if (thresholdRatio <= 0.16) {
-      const retainRatio = round6(thresholdRatio / 2)
-      policy.retainRatio = retainRatio > 0 && retainRatio < thresholdRatio
-        ? retainRatio
-        : thresholdRatio / 2
+    const prior = previousRows.get(key)
+    // Resolve the retention mode the installed row would actually inherit.
+    // The engine rejects retainRatio >= thresholdRatio and forbids combining
+    // retainRatio with retainTokens, so the emitted row must pick one mode and
+    // carry a value that stays valid under the new threshold.
+    // A row's own retention mode wins over the service config, matching the
+    // engine's per-row override resolution.
+    const mode = prior?.retainTokens !== undefined ? 'tokens'
+      : prior?.retainRatio !== undefined ? 'ratio'
+        : serviceConfig.retainTokens !== undefined ? 'tokens'
+          : 'ratio'
+    if (mode === 'tokens') {
+      const retainTokens = prior?.retainTokens ?? serviceConfig.retainTokens
+      // Max possible threshold tokens is floor(window * thresholdRatio); any
+      // retained tail at/above it can never be valid, so shrink it explicitly.
+      if (Number.isInteger(retainTokens) && retainTokens >= Math.floor(window * thresholdRatio)) {
+        policy.retainTokens = Math.max(Math.floor(window * thresholdRatio / 2), 0)
+      }
+    } else {
+      const inherited = typeof prior?.retainRatio === 'number' && Number.isFinite(prior.retainRatio)
+        ? prior.retainRatio
+        : typeof serviceConfig.retainRatio === 'number' && Number.isFinite(serviceConfig.retainRatio)
+          ? serviceConfig.retainRatio
+          : DEFAULT_RETAIN_RATIO
+      // dsh-compaction-basic requires 0 < retain < threshold. Keep the usual
+      // rounding unless it collapses the gap at a tiny scaled threshold, and
+      // emit an explicit retention whenever the inherited ratio would be
+      // invalid under the new threshold.
+      if (thresholdRatio <= 0.16 || round6(inherited) >= thresholdRatio) {
+        policy.retainRatio = validRetention(thresholdRatio)
+      }
     }
     policies.push(policy)
   }
@@ -172,16 +213,26 @@ export function catalogFor(llm) {
 export async function installPolicies(engine, llm, options = {}, commit) {
   if (engine === null || typeof engine !== 'object') return 0
   const models = await catalogFor(llm)
-  const policies = buildPolicies(models, options)
+  const previous = engine.config
+  const existing = Array.isArray(previous?.modelPolicies) ? previous.modelPolicies : []
+  const policies = buildPolicies(models, options, { previousRows: existing, serviceConfig: previous })
   if (policies.length === 0) return 0
   try {
-    const previous = engine.config
-    const existing = Array.isArray(previous?.modelPolicies) ? previous.modelPolicies : []
-    const merged = new Map(existing.map((policy) => [`${policy.provider}\u0000${policy.model}`, policy]))
-    for (const policy of policies) merged.set(`${policy.provider}\u0000${policy.model}`, policy)
-    const next = Object.freeze({ ...previous, modelPolicies: [...merged.values()] })
+    const merged = new Map(existing.map((policy) => [policyKey(policy), policy]))
+    for (const policy of policies) {
+      const key = policyKey(policy)
+      const prior = merged.get(key)
+      // Preserve unrelated per-model fields (headroomTokens, maxTokens,
+      // summarizationProvider/Model, retention) on a same-key replacement;
+      // only the generated fields override them.
+      merged.set(key, prior === undefined ? policy : { ...prior, ...policy })
+    }
+    const rows = [...merged.values()]
+    const next = Object.freeze({ ...previous, modelPolicies: rows })
+    // Pass the exact row objects that land in `next` so a commit receipt's
+    // ownership identity matches what disposal will compare against.
     if (commit === undefined) engine.config = next
-    else if (!commit(previous, next, policies)) return 0
+    else if (!commit(previous, next, rows)) return 0
     return policies.length
   } catch {
     return 0

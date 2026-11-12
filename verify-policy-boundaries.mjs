@@ -28,6 +28,10 @@ for (const forceAtTokens of [1, 2, 3, 500, 2000, 262144]) {
       if (policy.retainRatio !== undefined) {
         assert(policy.retainRatio > 0 && policy.retainRatio < policy.thresholdRatio)
       }
+      if (policy.retainTokens !== undefined) {
+        assert(Number.isInteger(policy.retainTokens) && policy.retainTokens >= 0)
+        assert(policy.retainRatio === undefined, 'retainTokens and retainRatio must stay mutually exclusive')
+      }
     }
     if (BasicCompactionEngine) {
       new BasicCompactionEngine(new Context(), { auto: false, modelPolicies: policies })
@@ -36,4 +40,49 @@ for (const forceAtTokens of [1, 2, 3, 500, 2000, 262144]) {
   }
 }
 console.log(`PASS ${checked} policy configurations${BasicCompactionEngine ? ' accepted by shipped BasicCompactionEngine' : ' (offline invariants only)'}`)
+
+// Decisive matrix: the shipped engine must accept the merged config the plugin
+// would produce under every admissible service-level retention mode and preset
+// per-model row, including customized retention the old code invalidated.
+const serviceRetentions = [
+  {},
+  { retainRatio: 0.16 },
+  { retainRatio: 0.3 },
+  { retainRatio: 0.5 },
+  { retainTokens: 2000 },
+  { retainTokens: 300000 },
+]
+const priorRowsByMode = [
+  [],
+  [{ provider: 'test', model: 'scaled', thresholdRatio: 0.4, headroomTokens: 12345, maxTokens: 99999, summarizationProvider: 'octo', summarizationModel: 'squid', retainRatio: 0.1 }],
+  [{ provider: 'test', model: 'scaled', thresholdRatio: 0.4, headroomTokens: 12345, maxTokens: 99999, summarizationProvider: 'octo', summarizationModel: 'squid', retainTokens: 2000 }],
+]
+let matrixChecked = 0
+for (const service of serviceRetentions) {
+  for (const priorRows of priorRowsByMode) {
+    for (const window of [1000000, 1048576, 2000000, 10000000]) {
+      const policies = buildPolicies(catalog(window), { forceAtTokens: 262144 }, {
+        previousRows: priorRows,
+        serviceConfig: service,
+      })
+      const merged = new Map(priorRows.map((row) => [`${row.provider}\u0000${row.model}`, row]))
+      for (const policy of policies) {
+        const key = `${policy.provider}\u0000${policy.model}`
+        merged.set(key, merged.has(key) ? { ...merged.get(key), ...policy } : policy)
+      }
+      const config = { auto: false, ...service, modelPolicies: [...merged.values()] }
+      let accepted = true
+      if (BasicCompactionEngine) {
+        try {
+          new BasicCompactionEngine(new Context(), config)
+        } catch {
+          accepted = false
+        }
+      }
+      assert(accepted, `shipped engine must accept merged config under ${JSON.stringify(service)} + ${JSON.stringify(priorRows)} + window ${window}`)
+      matrixChecked += 1
+    }
+  }
+}
+console.log(`PASS ${matrixChecked} retained-config matrix combinations${BasicCompactionEngine ? ' accepted by shipped BasicCompactionEngine' : ' (offline invariants only)'}`)
 console.log('LIMIT: no live profile, automatic activation, pressure event, or LLM request exercised')
