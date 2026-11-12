@@ -70,7 +70,7 @@ Config: `forceAtTokens` (default 262144), `minContextWindow` (default 500000),
 
 ## Verification
 
-- `node verify.mjs` — 34 assertions covering option normalization, policy
+- `node verify.mjs` — 40 assertions covering option normalization, policy
   math/filtering/retention (including customized and retainTokens retention
   modes and same-key field preservation), catalog caching and error skipping,
   frozen-config replacement + merge, section extraction, both note styles,
@@ -82,8 +82,8 @@ Config: `forceAtTokens` (default 262144), `minContextWindow` (default 500000),
 - `node verify-lifecycle.mjs <installed DSH node_modules>` — 7 real-Cordis
   lifecycle groups with the shipped engine and controlled catalog/summarizer
   I/O.
-- `node verify-install.mjs` — the portable-mount fixture checks (see "Live
-  mounting") run against a disposable temporary module, never against a live
+- `node verify-install.mjs` — 8 portable-mount fixture checks (see "Live
+  mounting") run against disposable temporary modules, never against a live
   profile.
 - Real boot check (disposable headless profile + `--patch`, scaled
   `forceAtTokens: 500`, `minContextWindow: 1000`): pressure compaction fired on
