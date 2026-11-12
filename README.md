@@ -97,14 +97,17 @@ Config: `forceAtTokens` (default 262144), `minContextWindow` (default 500000),
   - Where I was: No tool call has been executed yet; the request is still entirely outstanding.
   - Next: Call bash with command `python3 -c "print('A'*600)"`, ...
   ```
-- Guarded preset structural suite `node verify.mjs --profile web`: S1–S8 green
-  (Standard verbatim + exactly three intended rows: two pruner-spill rows and
-  the `compaction-force` row inside the compaction group).
-- `node catalog-report.mjs` (live composed profile, no boot): of 104 models with
-  a >500K window, **93 resolve exactly 262,144**, 11 (openrouter models whose
-  catalog declares a 943,718 output cap) resolve to 39,322 because the reserve
-  term wins, and 35 models at or below 500K are untouched. The two deepseek
-  routes are adapter-owned: a headless enumeration showed
+- No in-repo suite composes a live profile or asserts preset structure; the
+  `verify*.mjs` suites validate plugin logic against the shipped engine and a
+  real Cordis runtime with controlled catalog/summarizer I/O. A structural
+  preset check would require a composed profile fixture and is not included.
+- `node catalog-report.mjs` (live composed profile, no boot): on the 2026-11-12
+  live profile this reports 105 models with a >500K window — **94 resolve
+  exactly 262,144**, 11 (openrouter models whose catalog declares a 943,718
+  output cap) resolve to 39,322 because the reserve term wins, and 36 models at
+  or below 500K are untouched. These counts depend on the live composed profile
+  and drift as the catalog syncs; regenerate them in your environment. The two
+  deepseek routes are adapter-owned: a headless enumeration showed
   `deepseek-official/{deepseek-flash,deepseek-v4-pro}` (both 1,048,576 / 256,000)
   and no models on `deepseek-account`, so the report is a lower bound for those
   routes; the runtime plugin enumerates whatever the live process lists. The

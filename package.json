@@ -4,6 +4,22 @@
   "private": true,
   "type": "module",
   "description": "Forces ~256K pressure compaction on models whose context window exceeds 500K and appends a context note and/or a self-handoff note to the checkpoint.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lewbei/dsh-compaction-force.git"
+  },
+  "bugs": {
+    "url": "https://github.com/lewbei/dsh-compaction-force/issues"
+  },
+  "homepage": "https://github.com/lewbei/dsh-compaction-force",
+  "keywords": [
+    "dsh",
+    "compaction",
+    "compression",
+    "context-window",
+    "checkpoint"
+  ],
+  "author": "lewbei",
   "exports": {
     ".": "./index.js"
   },
@@ -11,8 +27,12 @@
     "index.js",
     "cordis.patch.yml",
     "README.md",
+    "READY",
     "verify.mjs",
     "verify-install.mjs",
+    "verify-lifecycle.mjs",
+    "verify-policy-boundaries.mjs",
+    "catalog-report.mjs",
     "scripts/prepare-patch.mjs"
   ],
   "dsh": {
