@@ -1132,19 +1132,42 @@ function computeShadowedBudget(input, agent, meter) {
       if (Array.isArray(measurement?.nodes) && measurement.nodes.length === nodes.length) {
         const head = nodes.length > 0 ? session.eventAt(nodes[0]) : undefined
         const firstIdx = head?.type === 'system/message' ? 1 : 0
-        const hasSys = firstIdx === 1 && session.deriveEventMessage(head) !== null
+        const headMsg = firstIdx === 1 ? session.deriveEventMessage(head) : null
+        const hasSys = headMsg !== null && isDeepStrictEqual(messages[0], headMsg)
         const regionMsgs = hasSys ? messages.slice(1) : messages
         if (regionMsgs.length > 0) {
-          let sum = 0
-          let matched = 0
+          let validNodes = true
+          const prefixTokens = new Array(nodes.length + 1).fill(0)
+          const derivedEntries = []
           for (let i = firstIdx; i < measurement.nodes.length; i += 1) {
             const node = measurement.nodes[i]
-            if (typeof node?.tokens !== 'number' || !Number.isFinite(node.tokens) || node.tokens < 0 || (node?.seq !== undefined && node.seq !== nodes[i])) break
-            sum += node.tokens
-            if (session.deriveEventMessage(session.eventAt(nodes[i])) !== null) {
-              matched += 1
-              if (matched === regionMsgs.length) return sum > 0 ? sum : Infinity
+            if (typeof node?.tokens !== 'number' || !Number.isFinite(node.tokens) || node.tokens < 0 || (node?.seq !== undefined && node.seq !== nodes[i])) {
+              validNodes = false
+              break
             }
+            prefixTokens[i + 1] = prefixTokens[i] + node.tokens
+            const derived = session.deriveEventMessage(session.eventAt(nodes[i]))
+            if (derived !== null) derivedEntries.push({ nodeIdx: i, msg: derived })
+          }
+          if (validNodes && regionMsgs.length <= derivedEntries.length) {
+            let bestSum = Infinity
+            const limit = derivedEntries.length - regionMsgs.length
+            for (let k = 0; k <= limit; k += 1) {
+              let match = true
+              for (let j = 0; j < regionMsgs.length; j += 1) {
+                if (!isDeepStrictEqual(derivedEntries[k + j].msg, regionMsgs[j])) {
+                  match = false
+                  break
+                }
+              }
+              if (match) {
+                const startNodeIdx = derivedEntries[k].nodeIdx
+                const endNodeIdx = derivedEntries[k + regionMsgs.length - 1].nodeIdx
+                const spanSum = prefixTokens[endNodeIdx + 1] - prefixTokens[startNodeIdx]
+                if (spanSum < bestSum) bestSum = spanSum
+              }
+            }
+            if (Number.isFinite(bestSum)) return bestSum > 0 ? bestSum : Infinity
           }
         }
       }
