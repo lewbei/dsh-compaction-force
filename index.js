@@ -44,7 +44,6 @@ export const DEFAULTS = Object.freeze({
 })
 
 const NOTE_VARIANTS = new Set(['off', 'context', 'handoff', 'both'])
-const WRAPPED = Symbol.for('@local/dsh-compaction-force/wrapped')
 const CORDIS_ORIGINAL = Symbol.for('cordis.original')
 const CATALOG_TTL_MS = 5 * 60 * 1000
 
@@ -576,63 +575,77 @@ function measureTokens(ctx, agent) {
   }
 }
 
-/** Wrap one engine's public summarize; appended note blocks land inside the checkpoint. */
+const wrapperRegistry = new WeakMap()
+
 function mountSummary(engine, ctx, options = {}) {
-  if (engine === null || typeof engine !== 'object' || engine[WRAPPED]) return null
-  const original = engine.summarize
-  if (typeof original !== 'function') return null
-  const descriptor = Object.getOwnPropertyDescriptor(engine, 'summarize')
-  const markerDescriptor = Object.getOwnPropertyDescriptor(engine, WRAPPED)
-  const token = {}
-  let active = true
+  const target = unwrapService(engine)
+  if (!isObjectRecord(target) || typeof target.summarize !== 'function') return null
   const resolved = normalizeOptions(options)
-  const variant = resolved.note
-  const heading = resolved.heading
-  const summarize = async function (input, agent, signal) {
+  const layer = { ctx, options: resolved }
+  const makeDispose = (entry) => {
+    let disposed = false
+    return () => {
+      if (disposed) return
+      disposed = true
+      const idx = entry.layers.indexOf(layer)
+      if (idx !== -1) entry.layers.splice(idx, 1)
+      if (entry.layers.length === 0) entry.restore()
+    }
+  }
+  const existing = wrapperRegistry.get(target)
+  if (existing !== undefined) {
+    existing.layers.push(layer)
+    return makeDispose(existing)
+  }
+  const original = target.summarize
+  const descriptor = Object.getOwnPropertyDescriptor(target, 'summarize')
+  const layers = [layer]
+  const wrapper = async function (input, agent, signal) {
     const result = await original.call(this, input, agent, signal)
-    if (!active || variant === 'off' || result === null || typeof result !== 'object' || !Array.isArray(result.summary)) return result
+    if (signal?.aborted === true) return result
+    const top = layers.at(-1)
+    if (!top || top.options.note === 'off' || !isObjectRecord(result) || !Array.isArray(result.summary)) return result
     const summaryText = result.summary
       .map((block) => (block !== null && typeof block === 'object' && typeof block.text === 'string' ? block.text : ''))
       .join('\n')
-    const sideConstraints = resolved.scExtract === 'pattern'
-      ? extractSideConstraints(Array.isArray(input?.messages) ? input.messages : [], { heading })
+    const sideConstraints = top.options.scExtract === 'pattern'
+      ? extractSideConstraints(Array.isArray(input?.messages) ? input.messages : [], { heading: top.options.heading })
       : []
     const text = buildNoteText({
-      variant,
-      heading,
+      variant: top.options.note,
+      heading: top.options.heading,
       summaryText,
-      totalTokens: measureTokens(ctx, agent),
+      totalTokens: measureTokens(top.ctx, agent),
       timestamp: new Date().toISOString(),
       sideConstraints,
     })
     if (text.length === 0) return result
     return { ...result, summary: [...result.summary, { type: 'text', text }] }
   }
-  const dispose = () => {
-    active = false
-    try {
-      if (Object.getOwnPropertyDescriptor(engine, 'summarize')?.value === summarize) {
-        if (descriptor) Object.defineProperty(engine, 'summarize', descriptor)
-        else delete engine.summarize
-      }
-    } finally {
-      if (engine[WRAPPED] === token) {
-        if (markerDescriptor) Object.defineProperty(engine, WRAPPED, markerDescriptor)
-        else delete engine[WRAPPED]
-      }
+  const restore = () => {
+    if (wrapperRegistry.get(target) === entry) wrapperRegistry.delete(target)
+    if (Object.getOwnPropertyDescriptor(target, 'summarize')?.value !== wrapper) return
+    if (descriptor) {
+      if (descriptor.configurable) Object.defineProperty(target, 'summarize', descriptor)
+      else target.summarize = descriptor.value
+    } else {
+      delete target.summarize
     }
   }
+  const entry = { layers, restore }
   try {
-    engine.summarize = summarize
-    engine[WRAPPED] = token
-    return dispose
+    target.summarize = wrapper
+    wrapperRegistry.set(target, entry)
+    return makeDispose(entry)
   } catch {
-    dispose()
+    restore()
     return null
   }
 }
 
 export function wrapSummarize(engine, ctx, options = {}) {
+  const target = unwrapService(engine)
+  if (!isObjectRecord(target) || wrapperRegistry.has(target)) return false
   return mountSummary(engine, ctx, options) !== null
 }
 
@@ -725,9 +738,6 @@ export function apply(ctx, config = {}) {
     const llm = scope?.llm
     if (engine === undefined || engine === null || typeof engine !== 'object') return
     scope.effect(() => {
-      // Policy installation is independent of the summary wrapper: a second
-      // instance on the same engine (or an engine whose summarize is not a
-      // function) must still install its policies.
       const disposeSummary = mountSummary(engine, scope, options) ?? (() => {})
       let active = true
       let inFlight = false
