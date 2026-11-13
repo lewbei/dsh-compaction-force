@@ -1313,67 +1313,172 @@ export function wrapSummarize(engine, ctx, options = {}) {
   return mountSummary(engine, ctx, options) !== null
 }
 
+const isPolicyRow = (value) => (
+  isObjectRecord(value)
+  && typeof value.provider === 'string'
+  && value.provider.length > 0
+  && typeof value.model === 'string'
+  && value.model.length > 0
+)
+
 const policyKey = policy => `${policy.provider}\u0000${policy.model}`
 
-const activeReceipts = new WeakMap()
+const enginePolicyStates = new WeakMap()
 
-const getActiveReceipts = (engine) => {
+const getEnginePolicyState = (engine) => {
   const key = unwrapService(engine)
-  let list = activeReceipts.get(key)
-  if (list === undefined) {
-    list = []
-    activeReceipts.set(key, list)
+  let state = enginePolicyStates.get(key)
+  if (state === undefined) {
+    state = {
+      mounts: [],
+      owned: new Map(),
+      lastWrittenConfig: null,
+      beforeFirstWriteConfig: null,
+    }
+    enginePolicyStates.set(key, state)
   }
-  return list
+  return state
 }
 
-function restorePolicies(engine, receipt) {
-  const list = activeReceipts.get(unwrapService(engine))
-  let laterReceipts = []
-  if (list !== undefined) {
-    const idx = list.indexOf(receipt)
-    if (idx !== -1) {
-      laterReceipts = list.slice(idx + 1)
-      list.splice(idx, 1)
+function reconcileEnginePolicies(engine, state, installNew) {
+  if (engine === null || typeof engine !== 'object') return 0
+  const current = engine.config
+  const rawPolicies = Array.isArray(current?.modelPolicies) ? current.modelPolicies : []
+  const currentPolicies = rawPolicies.filter(isObjectRecord)
+  const hadMalformed = currentPolicies.length !== rawPolicies.length
+  if (current !== state.lastWrittenConfig) state.beforeFirstWriteConfig = null
+
+  const firstByKey = new Map()
+  for (const row of currentPolicies) {
+    if (!isPolicyRow(row)) continue
+    const key = policyKey(row)
+    if (!firstByKey.has(key)) firstByKey.set(key, row)
+  }
+  for (const [key, entry] of [...state.owned.entries()]) {
+    const live = firstByKey.get(key)
+    if (live !== entry.installed || !isDeepStrictEqual(live, entry.snapshot)) {
+      state.owned.delete(key)
+      state.beforeFirstWriteConfig = null
     }
   }
-  const handedOff = new Set()
-  let handoffTargets = null
-  for (const [key, owned] of receipt.rows) {
-    if (!isDeepStrictEqual(owned.installed, owned.snapshot)) continue
-    for (const later of laterReceipts) {
-      const laterOwned = later.rows.get(key)
-      if (laterOwned !== undefined && laterOwned.previous === owned.installed) {
-        laterOwned.previous = owned.previous
-        handedOff.add(key)
-        if (handoffTargets === null) handoffTargets = new Set()
-        handoffTargets.add(later)
-        break
+  if (state.owned.size === 0) state.lastWrittenConfig = null
+
+  const baselineByKey = new Map()
+  for (const row of currentPolicies) {
+    if (!isPolicyRow(row)) continue
+    const key = policyKey(row)
+    if (baselineByKey.has(key)) continue
+    const entry = state.owned.get(key)
+    if (entry !== undefined) {
+      if (entry.baseline !== undefined) baselineByKey.set(key, entry.baseline)
+    } else {
+      baselineByKey.set(key, row)
+    }
+  }
+
+  const desiredByKey = new Map()
+  for (const mount of state.mounts) {
+    if (!Array.isArray(mount.models) || mount.models.length === 0) continue
+    const proposals = buildPolicies(mount.models, mount.options, {
+      previousRows: baselineByKey,
+      serviceConfig: current,
+    })
+    for (const proposal of proposals) {
+      const key = policyKey(proposal)
+      const prev = desiredByKey.get(key)
+      if (prev === undefined || proposal.thresholdRatio < prev.thresholdRatio) {
+        desiredByKey.set(key, proposal)
       }
     }
   }
-  if (handoffTargets !== null && handoffTargets.size === 1 && handedOff.size === receipt.rows.size) {
-    const [successor] = handoffTargets
-    if (successor.previous === receipt.next) successor.previous = receipt.previous
+
+  let changed = installNew && hadMalformed && (desiredByKey.size > 0 || state.owned.size > 0)
+  let updatedCount = 0
+  const nextPolicies = []
+  const nextOwned = new Map()
+  const seenKeys = new Set()
+
+  for (const row of currentPolicies) {
+    if (!isPolicyRow(row)) {
+      nextPolicies.push(row)
+      continue
+    }
+    const key = policyKey(row)
+    if (seenKeys.has(key)) {
+      nextPolicies.push(row)
+      continue
+    }
+    seenKeys.add(key)
+    const owned = state.owned.get(key)
+    if (owned !== undefined) {
+      const wanted = desiredByKey.get(key)
+      if (wanted !== undefined) {
+        const mergedRow = owned.baseline === undefined ? wanted : { ...owned.baseline, ...wanted }
+        if (isDeepStrictEqual(mergedRow, owned.installed)) {
+          nextPolicies.push(owned.installed)
+          nextOwned.set(key, owned)
+        } else {
+          nextPolicies.push(mergedRow)
+          nextOwned.set(key, { baseline: owned.baseline, installed: mergedRow, snapshot: { ...mergedRow } })
+          changed = true
+          updatedCount += 1
+        }
+      } else {
+        if (owned.baseline !== undefined) nextPolicies.push(owned.baseline)
+        changed = true
+      }
+    } else {
+      const wanted = installNew ? desiredByKey.get(key) : undefined
+      if (wanted !== undefined) {
+        const mergedRow = { ...row, ...wanted }
+        nextPolicies.push(mergedRow)
+        nextOwned.set(key, { baseline: row, installed: mergedRow, snapshot: { ...mergedRow } })
+        changed = true
+        updatedCount += 1
+      } else {
+        nextPolicies.push(row)
+      }
+    }
   }
 
-  const current = engine.config
-  if (!Array.isArray(current?.modelPolicies)) return
-  let changed = false
-  const restored = current.modelPolicies.flatMap(policy => {
-    if (!isObjectRecord(policy)) return [policy]
-    const key = policyKey(policy)
-    const owned = receipt.rows.get(key)
-    if (!owned || handedOff.has(key) || policy !== owned.installed || !isDeepStrictEqual(policy, owned.snapshot)) return [policy]
-    changed = true
-    return owned.previous === undefined ? [] : [owned.previous]
-  })
-  if (!changed) return
-  const previousRows = receipt.previous?.modelPolicies ?? []
-  const matchesPrevious = restored.length === previousRows.length && restored.every((row, index) => row === previousRows[index])
-  engine.config = current === receipt.next && matchesPrevious
-    ? receipt.previous
-    : Object.freeze({ ...current, modelPolicies: restored })
+  if (installNew) {
+    for (const [key, wanted] of desiredByKey) {
+      if (seenKeys.has(key)) continue
+      seenKeys.add(key)
+      nextPolicies.push(wanted)
+      nextOwned.set(key, { baseline: undefined, installed: wanted, snapshot: { ...wanted } })
+      changed = true
+      updatedCount += 1
+    }
+  }
+
+  if (!changed) return 0
+
+  if (state.lastWrittenConfig === null && state.beforeFirstWriteConfig === null) {
+    state.beforeFirstWriteConfig = current
+  }
+
+  let nextConfig
+  if (nextOwned.size === 0 && state.beforeFirstWriteConfig !== null) {
+    const previousRows = state.beforeFirstWriteConfig.modelPolicies ?? []
+    const matchesPrevious = nextPolicies.length === previousRows.length
+      && nextPolicies.every((row, index) => row === previousRows[index])
+    nextConfig = matchesPrevious
+      ? state.beforeFirstWriteConfig
+      : Object.freeze({ ...current, modelPolicies: nextPolicies })
+  } else {
+    nextConfig = Object.freeze({ ...current, modelPolicies: nextPolicies })
+  }
+
+  engine.config = nextConfig
+  state.owned = nextOwned
+  if (nextOwned.size === 0) {
+    state.lastWrittenConfig = null
+    state.beforeFirstWriteConfig = null
+  } else {
+    state.lastWrittenConfig = nextConfig
+  }
+  return updatedCount
 }
 
 /**
@@ -1403,29 +1508,16 @@ export function apply(ctx, config = {}) {
     if (engine === undefined || engine === null || typeof engine !== 'object') return
     scope.effect(() => {
       const disposeSummary = mountSummary(engine, scope, options) ?? (() => {})
+      const state = getEnginePolicyState(engine)
+      const mount = { options, models: null }
+      state.mounts.push(mount)
       let active = true
       let inFlight = false
       let rerunRequested = false
       let installEpoch = 0
+      let everApplied = false
       const timers = new Set()
-      const receipts = []
       const llmKey = llm !== null && typeof llm === 'object' ? unwrapService(llm) : null
-      const commit = (previous, next, policies) => {
-        const priorList = Array.isArray(previous?.modelPolicies) ? previous.modelPolicies.filter(isObjectRecord) : []
-        const previousRows = new Map(priorList.map(row => [policyKey(row), row]))
-        const receipt = {
-          previous,
-          next,
-          rows: new Map(policies.map(row => [policyKey(row), {
-            previous: previousRows.get(policyKey(row)), installed: row, snapshot: { ...row },
-          }])),
-        }
-        if (!active) return false
-        engine.config = next
-        receipts.push(receipt)
-        getActiveReceipts(engine).push(receipt)
-        return true
-      }
       const installLoop = async (initialAttempt) => {
         if (!active) return
         if (inFlight) {
@@ -1438,21 +1530,22 @@ export function apply(ctx, config = {}) {
           while (active) {
             rerunRequested = false
             const runEpoch = installEpoch
-            const { installed, catalogCount } = await runInstallPolicies(engine, llm, options, (previous, next, policies) => {
-              if (!active || runEpoch !== installEpoch) return false
-              return commit(previous, next, policies)
-            })
+            const models = await catalogFor(llm)
+            const catalogCount = models.length
             if (!active) return
             if (rerunRequested || runEpoch !== installEpoch) {
               attempt = 0
               continue
             }
+            mount.models = models
+            const installed = reconcileEnginePolicies(engine, state, true)
             if (installed > 0) {
+              everApplied = true
               log('info', `compaction-force: installed ${installed} model policies (forceAtTokens=${options.forceAtTokens}, minContextWindow=${options.minContextWindow})`)
               return
             }
             if (catalogCount > 0) {
-              if (receipts.length === 0) {
+              if (!everApplied) {
                 log('info', `compaction-force: no new model policies installed (no catalog model qualifies above minContextWindow=${options.minContextWindow} or tighter policy already active)`)
               }
               return
@@ -1493,7 +1586,9 @@ export function apply(ctx, config = {}) {
         try {
           disposeSummary()
         } finally {
-          for (const receipt of receipts.reverse()) restorePolicies(engine, receipt)
+          const idx = state.mounts.indexOf(mount)
+          if (idx !== -1) state.mounts.splice(idx, 1)
+          try { reconcileEnginePolicies(engine, state, false) } catch {}
         }
       }
     })
