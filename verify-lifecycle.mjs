@@ -524,6 +524,44 @@ await test('mountSummary keeps real BasicCompactionEngine compactPressure and co
     assert.ok(tinyRes !== null)
     assert.equal(tinyRes.summary.length, 1)
     assert.ok(framedTokens(tinyRes.summary) < tinyBudget)
+
+    const sNonLeadingTight = sessions.create(undefined, { meta: { cwd: '/tmp' } })
+    sNonLeadingTight.append('system/message', { message: { role: 'system', content: [{ type: 'text', text: 'System.' }] } }, { surfaceOp: 'append' })
+    sNonLeadingTight.append('request/header', { header })
+    sNonLeadingTight.append('turn/start', { turn: 1 })
+    sNonLeadingTight.append('user/message', { role: 'user', content: [{ type: 'text', text: 'Earlier huge message: ' + 'word '.repeat(2000) }] }, { surfaceOp: 'append' })
+    sNonLeadingTight.append('step/start', { turn: 1, step: 1 })
+    sNonLeadingTight.append('assistant/message', { turn: 1, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: 'Earlier huge reply.' }] }, stream: textStream('Earlier huge reply.') }, { surfaceOp: 'append' })
+    sNonLeadingTight.append('step/end', { turn: 1, step: 1 })
+    const uTight = sNonLeadingTight.append('user/message', { role: 'user', content: [{ type: 'text', text: 'Never deploy without release approval first. ' + 'x'.repeat(500) }] }, { surfaceOp: 'append' })
+    sNonLeadingTight.append('step/start', { turn: 1, step: 2 })
+    const aTight = sNonLeadingTight.append('assistant/message', { turn: 1, step: 2, message: { role: 'assistant', content: [{ type: 'text', text: 'Understood.' }] }, stream: textStream('Understood.') }, { surfaceOp: 'append' })
+    sNonLeadingTight.append('step/end', { turn: 1, step: 2 })
+    sNonLeadingTight.append('user/message', { role: 'user', content: [{ type: 'text', text: 'Trailing message.' }] }, { surfaceOp: 'append' })
+
+    const tightNodes = meter.measure(sNonLeadingTight).nodes
+    const tightBudget = tightNodes[3].tokens + tightNodes[4].tokens
+    const nonLeadingTightRes = await compaction.compactRegion(uTight.seq, aTight.seq, { session: sNonLeadingTight, options: { provider: 'test', model: 'large' } }, signal)
+    assert.ok(framedTokens(nonLeadingTightRes.summary) < tightBudget)
+    assert.equal(nonLeadingTightRes.summary.length, 1)
+
+    const sNonLeadingLarge = sessions.create(undefined, { meta: { cwd: '/tmp' } })
+    sNonLeadingLarge.append('system/message', { message: { role: 'system', content: [{ type: 'text', text: 'System.' }] } }, { surfaceOp: 'append' })
+    sNonLeadingLarge.append('request/header', { header })
+    sNonLeadingLarge.append('turn/start', { turn: 1 })
+    sNonLeadingLarge.append('user/message', { role: 'user', content: [{ type: 'text', text: 'hi' }] }, { surfaceOp: 'append' })
+    sNonLeadingLarge.append('step/start', { turn: 1, step: 1 })
+    sNonLeadingLarge.append('assistant/message', { turn: 1, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: 'ok' }] }, stream: textStream('ok') }, { surfaceOp: 'append' })
+    sNonLeadingLarge.append('step/end', { turn: 1, step: 1 })
+    const uLarge = sNonLeadingLarge.append('user/message', { role: 'user', content: [{ type: 'text', text: 'Never deploy without QA signoff. ' + 'huge '.repeat(2000) }] }, { surfaceOp: 'append' })
+    sNonLeadingLarge.append('step/start', { turn: 1, step: 2 })
+    const aLarge = sNonLeadingLarge.append('assistant/message', { turn: 1, step: 2, message: { role: 'assistant', content: [{ type: 'text', text: 'Noted.' }] }, stream: textStream('Noted.') }, { surfaceOp: 'append' })
+    sNonLeadingLarge.append('step/end', { turn: 1, step: 2 })
+    sNonLeadingLarge.append('user/message', { role: 'user', content: [{ type: 'text', text: 'Trailing.' }] }, { surfaceOp: 'append' })
+
+    const nonLeadingLargeRes = await compaction.compactRegion(uLarge.seq, aLarge.seq, { session: sNonLeadingLarge, options: { provider: 'test', model: 'large' } }, signal)
+    assert.equal(nonLeadingLargeRes.summary.length, 2)
+    assert.match(nonLeadingLargeRes.summary[1].text, /Never deploy without QA signoff\./)
   } finally {
     await ctx.fiber.dispose()
   }

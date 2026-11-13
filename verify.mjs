@@ -2242,6 +2242,93 @@ await test('reserved headings and unsafe timestamp/control characters are reject
   assert.deepEqual(recovered, ['Never deploy without approval.'])
 })
 
+await test('wrapSummarize: non-leading surface regions price against the matched region rather than earlier turns', async () => {
+  const estimateMessage = (msg) => {
+    const content = Array.isArray(msg?.content) ? msg.content : [{ type: 'text', text: String(msg?.content ?? '') }]
+    const chars = content.reduce((sum, block) => sum + String(block?.text ?? '').length, 0)
+    return Math.ceil(chars / 4) + 4
+  }
+  const summaryText = [
+    '## Current Work',
+    '- Refactoring module B cleanly across helpers.',
+    '## Next Step',
+    '- Run integration checks.',
+  ].join('\n')
+  const framedTokens = (blocks) => estimateMessage({
+    role: 'user',
+    content: [
+      { type: 'text', text: 'This is an automatically generated checkpoint condensing an earlier span of the conversation to free up context. Treat the captured context as established background and build on it without restating it. Continue the task directly from the messages that follow, without acknowledging this checkpoint.\n\n<compacted-summary>' },
+      ...blocks,
+      { type: 'text', text: '</compacted-summary>' },
+    ],
+  })
+  const makeSession = (records) => ({
+    surface: { nodes: records.map((r) => r.seq) },
+    eventAt: (seq) => records.find((r) => r.seq === seq),
+    deriveEventMessage: (ev) => ev?.msg ?? null,
+  })
+
+  const bareTokens = framedTokens([{ type: 'text', text: summaryText }])
+  const recordsA = [
+    { seq: 1, type: 'system/message', tokens: 20, msg: { role: 'system', content: [{ type: 'text', text: 'System.' }] } },
+    { seq: 2, type: 'user/message', tokens: 2000, msg: { role: 'user', content: [{ type: 'text', text: 'Huge earlier prompt' }] } },
+    { seq: 3, type: 'meta/marker', tokens: 500, msg: null },
+    { seq: 4, type: 'user/message', tokens: 12, msg: { role: 'user', content: [{ type: 'text', text: 'Never deploy without approval.' }] } },
+    { seq: 5, type: 'assistant/message', tokens: Math.max(bareTokens + 2 - 12, 20), msg: { role: 'assistant', content: [{ type: 'text', text: 'Okay.' }] } },
+  ]
+  const sessA = makeSession(recordsA)
+  const regionBudgetA = recordsA[3].tokens + recordsA[4].tokens
+  const engineA = makeEngine(summaryText)
+  wrapSummarize(engineA, fakeCtx({ tokenMeter: {
+    measure: () => ({ totalTokens: 3000, nodes: recordsA.map(({ seq, tokens }) => ({ seq, tokens })) }),
+    estimateMessage,
+  } }), { note: 'both', scExtract: 'pattern' })
+  const resA = await engineA.summarize({
+    messages: [recordsA[0].msg, recordsA[3].msg, recordsA[4].msg],
+  }, { session: sessA }, undefined)
+  assert.ok(framedTokens(resA.summary) < regionBudgetA)
+  assert.equal(resA.summary.length, 1)
+
+  const recordsB = [
+    { seq: 1, type: 'system/message', tokens: 20, msg: { role: 'system', content: [{ type: 'text', text: 'System.' }] } },
+    { seq: 2, type: 'user/message', tokens: 5, msg: { role: 'user', content: [{ type: 'text', text: 'hi' }] } },
+    { seq: 3, type: 'assistant/message', tokens: 5, msg: { role: 'assistant', content: [{ type: 'text', text: 'ok' }] } },
+    { seq: 4, type: 'user/message', tokens: 900, msg: { role: 'user', content: [{ type: 'text', text: 'Never skip regression tests.' }] } },
+    { seq: 5, type: 'meta/marker', tokens: 200, msg: null },
+    { seq: 6, type: 'assistant/message', tokens: 400, msg: { role: 'assistant', content: [{ type: 'text', text: 'Understood.' }] } },
+  ]
+  const sessB = makeSession(recordsB)
+  const engineB = makeEngine(summaryText)
+  wrapSummarize(engineB, fakeCtx({ tokenMeter: {
+    measure: () => ({ totalTokens: 1530, nodes: recordsB.map(({ seq, tokens }) => ({ seq, tokens })) }),
+    estimateMessage,
+  } }), { note: 'both', scExtract: 'pattern' })
+  const resB = await engineB.summarize({
+    messages: [recordsB[0].msg, recordsB[3].msg, recordsB[5].msg],
+  }, { session: sessB }, undefined)
+  assert.equal(resB.summary.length, 2)
+  assert.match(resB.summary[1].text, /Never skip regression tests\./)
+
+  const recordsC = [
+    { seq: 1, type: 'system/message', tokens: 20, msg: { role: 'system', content: [{ type: 'text', text: 'System.' }] } },
+    { seq: 2, type: 'user/message', tokens: 2000, msg: { role: 'user', content: [{ type: 'text', text: 'Repeated question' }] } },
+    { seq: 3, type: 'assistant/message', tokens: 2000, msg: { role: 'assistant', content: [{ type: 'text', text: 'Repeated answer' }] } },
+    { seq: 4, type: 'user/message', tokens: 12, msg: { role: 'user', content: [{ type: 'text', text: 'Repeated question' }] } },
+    { seq: 5, type: 'assistant/message', tokens: Math.max(bareTokens + 2 - 12, 20), msg: { role: 'assistant', content: [{ type: 'text', text: 'Repeated answer' }] } },
+  ]
+  const sessC = makeSession(recordsC)
+  const engineC = makeEngine(summaryText)
+  wrapSummarize(engineC, fakeCtx({ tokenMeter: {
+    measure: () => ({ totalTokens: 5000, nodes: recordsC.map(({ seq, tokens }) => ({ seq, tokens })) }),
+    estimateMessage,
+  } }), { note: 'both', scExtract: 'pattern' })
+  const resC = await engineC.summarize({
+    messages: [recordsC[0].msg, recordsC[3].msg, recordsC[4].msg],
+  }, { session: sessC }, undefined)
+  assert.equal(resC.summary.length, 1)
+  assert.ok(framedTokens(resC.summary) < recordsC[3].tokens + recordsC[4].tokens)
+})
+
 console.log(`\n${passed} passed, ${failed} failed`)
 if (failed > 0) {
   process.exitCode = 1
