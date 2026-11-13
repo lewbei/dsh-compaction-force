@@ -99,14 +99,19 @@ const validRetention = (thresholdRatio, window) => {
  * @returns {{ provider: string, model: string, thresholdRatio: number, retainRatio?: number, retainTokens?: number }[]}
  */
 export function buildPolicies(models, options = {}, context = {}) {
-  const forceAtTokens = toPositiveInt(options.forceAtTokens, DEFAULTS.forceAtTokens)
-  const minContextWindow = toPositiveInt(options.minContextWindow, DEFAULTS.minContextWindow)
-  const previousRows = context.previousRows instanceof Map
-    ? context.previousRows
-    : new Map(Array.isArray(context.previousRows)
-        ? context.previousRows.filter((row) => row !== null && typeof row === 'object').map((row) => [policyKey(row), row])
+  const safeOptions = options ?? {}
+  const safeContext = context ?? {}
+  const forceAtTokens = toPositiveInt(safeOptions.forceAtTokens, DEFAULTS.forceAtTokens)
+  const minContextWindow = toPositiveInt(safeOptions.minContextWindow, DEFAULTS.minContextWindow)
+  const previousRows = safeContext.previousRows instanceof Map
+    ? safeContext.previousRows
+    : new Map(Array.isArray(safeContext.previousRows)
+        ? safeContext.previousRows.filter((row) => row !== null && typeof row === 'object').map((row) => [policyKey(row), row])
         : [])
-  const serviceConfig = context.serviceConfig ?? {}
+  const serviceConfig = safeContext.serviceConfig ?? {}
+  const serviceThreshold = typeof serviceConfig.thresholdRatio === 'number' && Number.isFinite(serviceConfig.thresholdRatio) && serviceConfig.thresholdRatio > 0
+    ? serviceConfig.thresholdRatio
+    : 0.8
   const seen = new Set()
   const policies = []
   for (const entry of Array.isArray(models) ? models : []) {
@@ -116,24 +121,21 @@ export function buildPolicies(models, options = {}, context = {}) {
     if (typeof provider !== 'string' || provider.length === 0) continue
     if (typeof model !== 'string' || model.length === 0) continue
     if (!Number.isInteger(window) || window <= minContextWindow) continue
-    // A force target at or above the window (misconfigured row) would produce a
-    // thresholdRatio > 0.8, i.e. later than the shipped policy: skip it rather
-    // than silently installing a meaningless (or invalid >1) ratio.
     if (window <= forceAtTokens) continue
     const key = `${provider}\u0000${model}`
     if (seen.has(key)) continue
     seen.add(key)
+    const prior = previousRows.get(key)
+    const existingThreshold = typeof prior?.thresholdRatio === 'number' && Number.isFinite(prior.thresholdRatio) && prior.thresholdRatio > 0
+      ? prior.thresholdRatio
+      : serviceThreshold
     const thresholdRatio = round6(forceAtTokens / window)
     const thresholdTokens = Math.floor(window * thresholdRatio)
-    if (thresholdRatio <= 0 || thresholdRatio >= 0.8 || thresholdTokens <= 0) continue
+    if (thresholdRatio <= 0 || thresholdRatio >= Math.min(existingThreshold, 0.8) || thresholdTokens <= 0) continue
     const policy = { provider, model, thresholdRatio }
-    const prior = previousRows.get(key)
-    // Resolve the retention mode the installed row would actually inherit.
-    // The engine rejects retainRatio >= thresholdRatio and forbids combining
-    // retainRatio with retainTokens, so the emitted row must pick one mode and
-    // carry a value that stays valid under the new threshold.
-    // A row's own retention mode wins over the service config, matching the
-    // engine's per-row override resolution.
+    // @deepseek-ai/dsh-compaction-basic rejects retainRatio >= thresholdRatio,
+    // forbids combining retainRatio with retainTokens, and gives per-row
+    // overrides precedence over service defaults.
     const mode = prior?.retainTokens !== undefined ? 'tokens'
       : prior?.retainRatio !== undefined ? 'ratio'
         : serviceConfig.retainTokens !== undefined ? 'tokens'
@@ -682,12 +684,12 @@ export function apply(ctx, config = {}) {
     try {
       const logger = ctx.logger
       if (logger !== null && logger !== undefined && typeof logger[level] === 'function') logger[level](message)
-    } catch {
-      // logging is best-effort; never let it affect activation
-    }
+    } catch {}
   }
   if (config?.note !== undefined && !NOTE_VARIANTS.has(config.note)) {
-    log('warn', `compaction-force: unknown note value ${JSON.stringify(config.note)}; using "${options.note}"`)
+    let noteText
+    try { noteText = JSON.stringify(config.note) } catch { noteText = String(config.note) }
+    log('warn', `compaction-force: unknown note value ${noteText}; using "${options.note}"`)
   }
   ctx.inject(['compaction', 'llm'], (scope) => {
     const engine = scope?.compaction
