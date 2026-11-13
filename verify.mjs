@@ -1826,6 +1826,189 @@ await test('apply: multi-instance wrapper ownership survives FIFO disposal, opti
   overlayDisposers[0]()
   const afterOverlay = await sharedBase.summarize(input, {}, undefined)
   assert.match(afterOverlay.summary[1].text, /Note to Self \(context\)/)
+
+  const accessorOrig = async () => ({ summary: [{ type: 'text', text: 'Accessor base.' }] })
+  let backingFn = accessorOrig
+  let setterCalls = 0
+  const accessorEngine = { config: Object.freeze({ modelPolicies: [] }) }
+  Object.defineProperty(accessorEngine, 'summarize', {
+    configurable: true,
+    enumerable: true,
+    get() { return backingFn },
+    set(v) { setterCalls += 1; backingFn = v },
+  })
+  const accessorDisposers = []
+  apply({
+    logs: [],
+    logger: { info() {}, warn() {} },
+    inject(_names, cb) {
+      cb({
+        compaction: accessorEngine,
+        llm,
+        tokenMeter: { measure: () => ({ totalTokens: 10000 }) },
+        effect(fn) {
+          const d = fn()
+          accessorDisposers.push(d)
+          return d
+        },
+      })
+    },
+  }, { note: 'context' })
+  assert.equal(setterCalls, 0)
+  assert.equal(backingFn, accessorOrig)
+  assert.equal((await accessorEngine.summarize(input, {}, undefined)).summary.length, 2)
+  accessorDisposers[0]()
+  const restoredDesc = Object.getOwnPropertyDescriptor(accessorEngine, 'summarize')
+  assert.equal(typeof restoredDesc.get, 'function')
+  assert.equal(typeof restoredDesc.set, 'function')
+  assert.equal(accessorEngine.summarize, accessorOrig)
+
+  const outerAccessorEngine = { config: Object.freeze({ modelPolicies: [] }) }
+  let outerAccessorBacking = accessorOrig
+  Object.defineProperty(outerAccessorEngine, 'summarize', {
+    configurable: true,
+    enumerable: true,
+    get() { return outerAccessorBacking },
+    set(v) { outerAccessorBacking = v },
+  })
+  const outerAccDisposers = []
+  apply({
+    logs: [],
+    logger: { info() {}, warn() {} },
+    inject(_names, cb) {
+      cb({
+        compaction: outerAccessorEngine,
+        llm,
+        tokenMeter: { measure: () => ({ totalTokens: 10000 }) },
+        effect(fn) {
+          const d = fn()
+          outerAccDisposers.push(d)
+          return d
+        },
+      })
+    },
+  }, { note: 'context' })
+  const accInner = outerAccessorEngine.summarize
+  const accOuter = async function (...args) { return { ...await accInner.apply(this, args), external: true } }
+  outerAccessorEngine.summarize = accOuter
+  outerAccDisposers[0]()
+  assert.equal(outerAccessorEngine.summarize, accOuter)
+
+  let ncBacking = accessorOrig
+  const ncAccessorEngine = { config: Object.freeze({ modelPolicies: [] }) }
+  Object.defineProperty(ncAccessorEngine, 'summarize', {
+    configurable: false,
+    enumerable: true,
+    get() { return ncBacking },
+    set(v) { ncBacking = v },
+  })
+  assert.equal(wrapSummarize(ncAccessorEngine, fakeCtx({}), { note: 'context' }), true)
+  const ncWrapped = ncAccessorEngine.summarize
+  assert.notEqual(ncWrapped, accessorOrig)
+  const nonExtProto = {
+    get summarize() { return ncBacking },
+    set summarize(v) { ncBacking = v },
+  }
+  const nonExtProtoEngine = Object.preventExtensions(Object.assign(Object.create(nonExtProto), {
+    config: Object.freeze({ modelPolicies: [] }),
+  }))
+  const protoAccessorDisposers = []
+  apply({
+    logs: [],
+    logger: { info() {}, warn() {} },
+    inject(_names, cb) {
+      cb({
+        compaction: nonExtProtoEngine,
+        llm,
+        tokenMeter: { measure: () => ({ totalTokens: 10000 }) },
+        effect(fn) {
+          const d = fn()
+          protoAccessorDisposers.push(d)
+          return d
+        },
+      })
+    },
+  }, { note: 'context' })
+  assert.notEqual(nonExtProtoEngine.summarize, ncWrapped)
+  protoAccessorDisposers[0]()
+  assert.equal(nonExtProtoEngine.summarize, ncWrapped)
+
+  let ncMountBacking = accessorOrig
+  const ncMountEngine = { config: Object.freeze({ modelPolicies: [] }) }
+  Object.defineProperty(ncMountEngine, 'summarize', {
+    configurable: false,
+    enumerable: true,
+    get() { return ncMountBacking },
+    set(v) { ncMountBacking = v },
+  })
+  const ncMountDisposers = []
+  apply({
+    logs: [],
+    logger: { info() {}, warn() {} },
+    inject(_names, cb) {
+      cb({
+        compaction: ncMountEngine,
+        llm,
+        tokenMeter: { measure: () => ({ totalTokens: 10000 }) },
+        effect(fn) {
+          const d = fn()
+          ncMountDisposers.push(d)
+          return d
+        },
+      })
+    },
+  }, { note: 'context' })
+  assert.notEqual(ncMountEngine.summarize, accessorOrig)
+  ncMountDisposers[0]()
+  assert.equal(ncMountEngine.summarize, accessorOrig)
+
+  let releaseSlow
+  let markStarted
+  const slowEngine = {
+    config: Object.freeze({ modelPolicies: [] }),
+    async summarize() {
+      markStarted()
+      return await new Promise((resolve) => { releaseSlow = resolve })
+    },
+  }
+  const snapshotDisposers = []
+  const mountSnapshot = (mountOpts) => apply({
+    logs: [],
+    logger: { info() {}, warn() {} },
+    inject(_names, cb) {
+      cb({
+        compaction: slowEngine,
+        llm,
+        tokenMeter: { measure: () => ({ totalTokens: 10000 }) },
+        effect(fn) {
+          const d = fn()
+          snapshotDisposers.push(d)
+          return d
+        },
+      })
+    },
+  }, mountOpts)
+
+  mountSnapshot({ note: 'context' })
+  mountSnapshot({ note: 'off' })
+  let startedPromise = new Promise((resolve) => { markStarted = resolve })
+  const pendingOff = slowEngine.summarize(input, {}, undefined)
+  await startedPromise
+  snapshotDisposers[1]()
+  releaseSlow({ summary: [{ type: 'text', text: 'Mid-flight off.' }] })
+  assert.equal((await pendingOff).summary.length, 1)
+
+  startedPromise = new Promise((resolve) => { markStarted = resolve })
+  const pendingContext = slowEngine.summarize(input, {}, undefined)
+  await startedPromise
+  mountSnapshot({ note: 'handoff', heading: 'Late Mount' })
+  releaseSlow({ summary: [{ type: 'text', text: 'Mid-flight mount.' }] })
+  const contextRes = await pendingContext
+  assert.equal(contextRes.summary.length, 2)
+  assert.match(contextRes.summary[1].text, /Note to Self \(context\)/)
+  assert.doesNotMatch(contextRes.summary[1].text, /## Late Mount/)
+  snapshotDisposers[2]()
+  snapshotDisposers[0]()
 })
 
 await test('buildNoteText and wrapSummarize: exact small token formatting, text-only blocks, requestHeader forwarding, and engine meter fallback', async () => {
