@@ -917,6 +917,55 @@ await test('buildPolicies and apply: preserve tighter thresholds and tolerate nu
   assert.ok(ctx.logs.some(([level, message]) => level === 'warn' && message.includes('unknown note value 1')))
 })
 
+await test('collectCatalog: awaits async listProviders, handles rejections and iterables, deduplicates entries', async () => {
+  const asyncIterableLlm = {
+    listModelsCalls: 0,
+    async listProviders() { return new Set([{ id: 'p' }, 'p']) },
+    async listModels() {
+      this.listModelsCalls += 1
+      return new Set([{ id: 'm' }, 'm'])
+    },
+    resolveCalls: 0,
+    async resolveModelInfo(provider, model) {
+      this.resolveCalls += 1
+      return { provider, id: model, context: { contextWindow: 1000000 } }
+    },
+  }
+  const catalog = await collectCatalog(asyncIterableLlm)
+  assert.deepEqual(catalog, [{ provider: 'p', model: 'm', contextWindow: 1000000 }])
+  assert.equal(asyncIterableLlm.listModelsCalls, 1)
+  assert.equal(asyncIterableLlm.resolveCalls, 1)
+
+  const throwingIteratorLlm = {
+    listProviders() {
+      return {
+        *[Symbol.iterator]() {
+          yield 'p'
+          throw new Error('iterator boom')
+        },
+      }
+    },
+    async listModels() { return ['m'] },
+    async resolveModelInfo(provider, model) { return { provider, id: model, context: { contextWindow: 1000000 } } },
+  }
+  assert.deepEqual(await collectCatalog(throwingIteratorLlm), [{ provider: 'p', model: 'm', contextWindow: 1000000 }])
+
+  let unhandled = null
+  const onUnhandled = (reason) => { unhandled = reason }
+  process.once('unhandledRejection', onUnhandled)
+  let failedCatalog
+  try {
+    failedCatalog = await collectCatalog({
+      listProviders: () => Promise.reject(new Error('rpc transport failed')),
+    })
+    await tick()
+  } finally {
+    process.removeListener('unhandledRejection', onUnhandled)
+  }
+  assert.deepEqual(failedCatalog, [])
+  assert.equal(unhandled, null)
+})
+
 console.log(`\n${passed} passed, ${failed} failed`)
 if (failed > 0) {
   process.exitCode = 1
