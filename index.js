@@ -525,19 +525,24 @@ export function extractSideConstraints(messages, options = {}) {
 }
 
 /** Build the note text appended to a checkpoint (empty string when nothing to add). */
-export function buildNoteText({ variant, heading = DEFAULTS.heading, summaryText = '', totalTokens = null, timestamp = null, sideConstraints = [] }) {
+export function buildNoteText({ variant, heading = DEFAULTS.heading, summaryText = '', totalTokens = null, timestamp = null, sideConstraints = [], compact = false }) {
   const parts = []
   if (variant === 'context' || variant === 'both') {
     const size = Number.isInteger(totalTokens) && totalTokens > 0
       ? (totalTokens >= 1000 ? `~${Math.round(totalTokens / 1000)}K tokens` : `~${totalTokens} tokens`)
       : 'the context limit'
     const when = typeof timestamp === 'string' && timestamp.length > 0 ? ` on ${timestamp}` : ''
-    parts.push([
-      '## Note to Self (context)',
-      `- The earlier conversation was compacted at ${size}${when}.`,
-      '- This checkpoint is the authoritative record of that span; do not restate it.',
-      '- Re-read a file before editing it if you are relying on a pre-compaction memory.',
-    ].join('\n'))
+    parts.push(compact
+      ? [
+          '## Note to Self (context)',
+          `- Compacted at ${size}${when}; authoritative checkpoint above, re-read files before editing.`,
+        ].join('\n')
+      : [
+          '## Note to Self (context)',
+          `- The earlier conversation was compacted at ${size}${when}.`,
+          '- This checkpoint is the authoritative record of that span; do not restate it.',
+          '- Re-read a file before editing it if you are relying on a pre-compaction memory.',
+        ].join('\n'))
   }
   if (Array.isArray(sideConstraints) && sideConstraints.length > 0) {
     const scLines = ['## Active Constraints (preserve these)']
@@ -545,19 +550,20 @@ export function buildNoteText({ variant, heading = DEFAULTS.heading, summaryText
       // Sanitize so a constraint cannot inject extra markdown/newlines into the note.
       scLines.push(`- ${String(sc).replace(/\s+/g, ' ').trim()}`)
     }
-    scLines.push('- These are user-issued side constraints for this session; they MUST survive every compaction.')
+    if (!compact) scLines.push('- These are user-issued side constraints for this session; they MUST survive every compaction.')
     parts.push(scLines.join('\n'))
   }
   if (variant === 'handoff' || variant === 'both') {
-    const where = sectionBullets(summaryText, 'Current Work')
-    const next = sectionBullets(summaryText, 'Next Step', 1, 300)
-    const guard = sectionBullets(summaryText, 'Critical Context', 3, 300)
+    const maxChars = compact ? 100 : 300
+    const where = sectionBullets(summaryText, 'Current Work', compact ? 2 : 3, maxChars)
+    const next = sectionBullets(summaryText, 'Next Step', 1, maxChars)
+    const guard = sectionBullets(summaryText, 'Critical Context', compact ? 2 : 3, maxChars)
     const lines = [`## ${heading}`]
     if (where.length > 0) lines.push(`- Where I was: ${where.join(' ')}`)
     if (next.length > 0) lines.push(`- Next: ${next.join(' ')}`)
     if (guard.length > 0) lines.push(`- Guardrails: ${guard.join(' ')}`)
-    if (lines.length === 1) lines.push('- Resume from the checkpoint above; its "Current Work" and "Next Step" sections are authoritative.')
-    parts.push(lines.join('\n'))
+    if (lines.length === 1 && !compact) lines.push('- Resume from the checkpoint above; its "Current Work" and "Next Step" sections are authoritative.')
+    if (lines.length > 1) parts.push(lines.join('\n'))
   }
   return parts.length === 0 ? '' : `\n\n${parts.join('\n\n')}\n`
 }
@@ -570,9 +576,8 @@ function resolveMeter(ctx, engine) {
   return readMeter(ctx) ?? readMeter(unwrapService(engine)?.ctx)
 }
 
-function measureTokens(ctx, engine, agent) {
+function measureTokensFromMeter(meter, agent) {
   try {
-    const meter = resolveMeter(ctx, engine)
     if (meter === null || meter === undefined || typeof meter.measure !== 'function') return null
     const header = typeof agent?.session?.requestHeader === 'function' ? agent.session.requestHeader() : undefined
     const measurement = header !== undefined ? meter.measure(agent?.session, header) : meter.measure(agent?.session)
@@ -580,6 +585,111 @@ function measureTokens(ctx, engine, agent) {
     return Number.isInteger(total) && total > 0 ? total : null
   } catch {
     return null
+  }
+}
+
+const FRAME_OPEN_TEXT = 'This is an automatically generated checkpoint condensing an earlier span of the conversation to free up context. Treat the captured context as established background and build on it without restating it. Continue the task directly from the messages that follow, without acknowledging this checkpoint.\n\n<compacted-summary>'
+const FRAME_CLOSE_TEXT = '</compacted-summary>'
+
+function computeShadowedBudget(input, agent, meter) {
+  if (typeof meter?.estimateMessage !== 'function') return Infinity
+  const messages = input?.messages
+  if (!Array.isArray(messages) || messages.length === 0) return Infinity
+  const session = agent?.session
+  const nodes = session?.surface?.nodes
+  if (
+    Array.isArray(nodes)
+    && typeof session?.eventAt === 'function'
+    && typeof session?.deriveEventMessage === 'function'
+    && typeof meter?.measure === 'function'
+  ) {
+    try {
+      const measurement = meter.measure(session)
+      if (Array.isArray(measurement?.nodes) && measurement.nodes.length === nodes.length) {
+        const head = nodes.length > 0 ? session.eventAt(nodes[0]) : undefined
+        const firstIdx = head?.type === 'system/message' ? 1 : 0
+        const hasSys = firstIdx === 1 && session.deriveEventMessage(head) !== null
+        const regionMsgs = hasSys ? messages.slice(1) : messages
+        if (regionMsgs.length > 0) {
+          let sum = 0
+          let matched = 0
+          for (let i = firstIdx; i < measurement.nodes.length; i += 1) {
+            const node = measurement.nodes[i]
+            if (typeof node?.tokens !== 'number' || !Number.isFinite(node.tokens) || node.tokens < 0 || (node?.seq !== undefined && node.seq !== nodes[i])) break
+            sum += node.tokens
+            if (session.deriveEventMessage(session.eventAt(nodes[i])) !== null) {
+              matched += 1
+              if (matched === regionMsgs.length) return sum > 0 ? sum : Infinity
+            }
+          }
+        }
+      }
+    } catch {}
+  }
+  try {
+    const body = messages.length > 1 && messages[0]?.role === 'system' ? messages.slice(1) : messages
+    let sum = 0
+    for (const msg of body) {
+      const tokens = meter.estimateMessage(msg)
+      if (!Number.isFinite(tokens) || tokens < 0) return Infinity
+      sum += tokens
+    }
+    return sum > 0 ? sum : Infinity
+  } catch {
+    return Infinity
+  }
+}
+
+function fitNoteToBudget(noteArgs, baseSummary, budget, meter) {
+  if (!Number.isFinite(budget) || typeof meter?.estimateMessage !== 'function') {
+    return buildNoteText(noteArgs)
+  }
+  const fits = (extraText) => {
+    const content = extraText.length > 0
+      ? [...baseSummary, { type: 'text', text: extraText }]
+      : baseSummary
+    const tokens = meter.estimateMessage({
+      role: 'user',
+      content: [
+        { type: 'text', text: FRAME_OPEN_TEXT },
+        ...content,
+        { type: 'text', text: FRAME_CLOSE_TEXT },
+      ],
+    })
+    return Number.isFinite(tokens) && tokens < budget
+  }
+  try {
+    if (!fits('')) return ''
+    const full = buildNoteText({ ...noteArgs, compact: false })
+    if (full.length === 0 || fits(full)) return full
+    const compactBoth = buildNoteText({ ...noteArgs, compact: true })
+    if (compactBoth.length > 0 && fits(compactBoth)) return compactBoth
+    if (noteArgs.variant === 'both') {
+      for (const variant of ['handoff', 'context']) {
+        const candidate = buildNoteText({ ...noteArgs, variant, compact: true })
+        if (candidate.length > 0 && fits(candidate)) return candidate
+      }
+    }
+    const constraints = Array.isArray(noteArgs.sideConstraints) ? noteArgs.sideConstraints : []
+    for (let count = constraints.length; count >= 1; count -= 1) {
+      const candidate = buildNoteText({
+        ...noteArgs,
+        variant: 'off',
+        sideConstraints: constraints.slice(0, count),
+        compact: true,
+      })
+      if (candidate.length > 0 && fits(candidate)) return candidate
+    }
+    if (noteArgs.variant !== 'off') {
+      const variants = noteArgs.variant === 'both' ? ['handoff', 'context'] : [noteArgs.variant]
+      for (const variant of variants) {
+        const candidate = buildNoteText({ ...noteArgs, variant, sideConstraints: [], compact: true })
+        if (candidate.length > 0 && fits(candidate)) return candidate
+      }
+    }
+    return ''
+  } catch {
+    return buildNoteText(noteArgs)
   }
 }
 
@@ -620,14 +730,16 @@ function mountSummary(engine, ctx, options = {}) {
     const sideConstraints = top.options.scExtract === 'pattern'
       ? extractSideConstraints(Array.isArray(input?.messages) ? input.messages : [], { heading: top.options.heading })
       : []
-    const text = buildNoteText({
+    const meter = resolveMeter(top.ctx, target)
+    const budget = computeShadowedBudget(input, agent, meter)
+    const text = fitNoteToBudget({
       variant: top.options.note,
       heading: top.options.heading,
       summaryText,
-      totalTokens: measureTokens(top.ctx, target, agent),
+      totalTokens: measureTokensFromMeter(meter, agent),
       timestamp: new Date().toISOString(),
       sideConstraints,
-    })
+    }, result.summary, budget, meter)
     if (text.length === 0) return result
     return { ...result, summary: [...result.summary, { type: 'text', text }] }
   }

@@ -7,6 +7,9 @@ assert(process.argv[2], 'Pass the installed DSH node_modules directory')
 const modules = resolve(process.argv[2])
 const { Context, Service } = await import(pathToFileURL(join(modules, '@deepseek-ai/cordis/lib/index.js')))
 const { BasicCompactionEngine } = await import(pathToFileURL(join(modules, '@deepseek-ai/dsh-compaction-basic/lib/index.js')))
+const { SessionStore } = await import(pathToFileURL(join(modules, '@deepseek-ai/dsh-session/lib/index.js')))
+const { SessionProjectionRegistry } = await import(pathToFileURL(join(modules, '@deepseek-ai/dsh-session-projection/lib/index.js')))
+const { TokenMeter } = await import(pathToFileURL(join(modules, '@deepseek-ai/dsh-token-meter/lib/index.js')))
 const flush = () => new Promise(setImmediate)
 const signal = new AbortController().signal
 const input = { messages: [{ role: 'user', content: [{ type: 'text', text: 'Never deploy without approval.' }] }] }
@@ -383,6 +386,144 @@ await test('mountSummary filters non-text blocks, avoids ~0K rounding, forwards 
     assert.doesNotMatch(result.summary[2].text, /~0K tokens|hidden thought|hidden step/)
     assert.match(result.summary[2].text, /Where I was: public work/)
     assert.match(result.summary[2].text, /Next: ship patch/)
+  } finally {
+    await ctx.fiber.dispose()
+  }
+})
+
+await test('mountSummary keeps real BasicCompactionEngine compactPressure and compactNow under tight shadowed token budgets', async () => {
+  const summaryText = [
+    '## Primary Request and Intent',
+    '- Build the feature carefully.',
+    '## Current Work',
+    '- Working on module A.',
+    '## Next Step',
+    '- Run tests.',
+    '## Critical Context',
+    '- Check edge cases.',
+  ].join('\n')
+
+  class FakeLlm extends Service {
+    constructor(ctx) { super(ctx, 'llm') }
+    listProviders() { return [{ id: 'test', name: 'test' }] }
+    async listModels() { return [{ provider: 'test', id: 'large', name: 'large' }] }
+    async resolveModelInfo() {
+      return { provider: 'test', id: 'large', name: 'large', context: { contextWindow: 1000000 }, defaultMaxTokens: 1000 }
+    }
+    imageRequestPricing() { return undefined }
+    fileRequestText(ref) { return `[file:${ref?.id ?? 'x'}]` }
+    async *stream() {
+      yield { type: 'text-delta', index: 0, text: summaryText }
+      yield { type: 'finish', finishReason: 'stop', usage: { inputTokens: 10, outputTokens: 10 } }
+    }
+  }
+
+  const ctx = new Context()
+  await ctx.plugin(SessionProjectionRegistry)
+  await ctx.plugin(SessionStore)
+  await ctx.plugin(TokenMeter)
+  await ctx.plugin(FakeLlm)
+  const isolated = ctx.isolate('compaction').isolate('toolResultPruner')
+  await isolated.plugin(BasicCompactionEngine, { auto: false })
+  await isolated.plugin(plugin, { note: 'both', forceAtTokens: 262144, minContextWindow: 500000, scExtract: 'pattern' })
+  await flush()
+  const textStream = (text) => [{ type: 'text-chunks', time0: 0, index: 0, dt: [0], texts: [text] }]
+  const header = { config: { provider: 'test', model: 'large', maxTokens: 1000 } }
+  const userText = [
+    'Never deploy without explicit approval from the release manager first.',
+    'Always run the complete regression test suite before merging any pull request.',
+    'Do not modify any production database schema without a rollback plan.',
+    'Never share customer credentials or API tokens in logs or chat output.',
+    'Keep compatibility with Node 20 and existing exports intact.',
+    'Background context filler: ' + 'token '.repeat(160),
+  ].join(' ')
+  try {
+    const sessions = ctx.get('sessions')
+    const meter = ctx.get('tokenMeter')
+    const compaction = isolated.get('compaction')
+    assert.equal(compaction.config.modelPolicies.length, 1)
+    assert.equal(compaction.config.modelPolicies[0].thresholdRatio, 0.262144)
+
+    const framedTokens = (summaryBlocks) => meter.estimateMessage({
+      role: 'user',
+      content: [
+        { type: 'text', text: 'This is an automatically generated checkpoint condensing an earlier span of the conversation to free up context. Treat the captured context as established background and build on it without restating it. Continue the task directly from the messages that follow, without acknowledging this checkpoint.\n\n<compacted-summary>' },
+        ...summaryBlocks,
+        { type: 'text', text: '</compacted-summary>' },
+      ],
+    })
+
+    const sPressure = sessions.create(undefined, { meta: { cwd: '/tmp' } })
+    sPressure.append('system/message', { message: { role: 'system', content: [{ type: 'text', text: 'System.' }] } }, { surfaceOp: 'append' })
+    sPressure.append('request/header', { header })
+    sPressure.append('turn/start', { turn: 1 })
+    sPressure.append('user/message', { role: 'user', content: [{ type: 'text', text: userText }] }, { surfaceOp: 'append' })
+    sPressure.append('step/start', { turn: 1, step: 1 })
+    sPressure.append('assistant/message', {
+      turn: 1, step: 1,
+      message: { role: 'assistant', content: [{ type: 'text', text: 'Acknowledged.' }] },
+      stream: textStream('Acknowledged.'),
+    }, { surfaceOp: 'append' })
+    sPressure.append('step/end', { turn: 1, step: 1 })
+    sPressure.append('user/message', { role: 'user', content: [{ type: 'text', text: 'Log:\n' + 'A'.repeat(1047200) }] }, { surfaceOp: 'append' })
+
+    const pressureBudget = meter.measure(sPressure).nodes.slice(1, 3).reduce((sum, n) => sum + n.tokens, 0)
+    const pressureRes = await compaction.compactPressure({ session: sPressure, options: { provider: 'test', model: 'large' } }, header, signal, false)
+    assert.ok(pressureRes !== null)
+    assert.equal(pressureRes.summary.length, 2)
+    assert.match(pressureRes.summary[1].text, /Active Constraints|Never deploy/)
+    assert.doesNotMatch(pressureRes.summary[1].text, /MUST survive every compaction/)
+    assert.ok(framedTokens(pressureRes.summary) < pressureBudget)
+    const pressureCheckpoint = sPressure.deriveEventMessage(sPressure.eventAt(sPressure.surface.nodes[1]))
+    assert.match(pressureCheckpoint.content.map((b) => b.text).join('\n'), /Never deploy/)
+
+    const sShort = sessions.create(undefined, { meta: { cwd: '/tmp' } })
+    sShort.append('system/message', { message: { role: 'system', content: [{ type: 'text', text: 'System.' }] } }, { surfaceOp: 'append' })
+    sShort.append('request/header', { header })
+    sShort.append('user/message', { role: 'user', content: [{ type: 'text', text: userText }] }, { surfaceOp: 'append' })
+    sShort.append('step/start', { turn: 1, step: 1 })
+    sShort.append('assistant/message', {
+      turn: 1, step: 1,
+      message: { role: 'assistant', content: [{ type: 'text', text: 'Okay.' }] },
+      stream: textStream('Okay.'),
+    }, { surfaceOp: 'append' })
+    sShort.append('step/end', { turn: 1, step: 1 })
+
+    const shortBudget = meter.measure(sShort).nodes[1].tokens
+    const shortRes = await compaction.compactNow({
+      session: sShort,
+      options: { provider: 'test', model: 'large' },
+      runMaintenance: (fn) => fn(signal),
+    }, signal)
+    assert.ok(shortRes !== null)
+    assert.equal(shortRes.summary.length, 2)
+    assert.match(shortRes.summary[1].text, /Active Constraints|Never deploy/)
+    assert.doesNotMatch(shortRes.summary[1].text, /MUST survive every compaction/)
+    assert.ok(framedTokens(shortRes.summary) < shortBudget)
+    const shortCheckpoint = sShort.deriveEventMessage(sShort.eventAt(sShort.surface.nodes[1]))
+    assert.match(shortCheckpoint.content.map((b) => b.text).join('\n'), /Never deploy/)
+
+    const sTiny = sessions.create(undefined, { meta: { cwd: '/tmp' } })
+    sTiny.append('system/message', { message: { role: 'system', content: [{ type: 'text', text: 'System.' }] } }, { surfaceOp: 'append' })
+    sTiny.append('request/header', { header })
+    sTiny.append('user/message', { role: 'user', content: [{ type: 'text', text: 'Never deploy.\n' + 'x'.repeat(600) }] }, { surfaceOp: 'append' })
+    sTiny.append('step/start', { turn: 1, step: 1 })
+    sTiny.append('assistant/message', {
+      turn: 1, step: 1,
+      message: { role: 'assistant', content: [{ type: 'text', text: 'Done.' }] },
+      stream: textStream('Done.'),
+    }, { surfaceOp: 'append' })
+    sTiny.append('step/end', { turn: 1, step: 1 })
+
+    const tinyBudget = meter.measure(sTiny).nodes[1].tokens
+    const tinyRes = await compaction.compactNow({
+      session: sTiny,
+      options: { provider: 'test', model: 'large' },
+      runMaintenance: (fn) => fn(signal),
+    }, signal)
+    assert.ok(tinyRes !== null)
+    assert.equal(tinyRes.summary.length, 1)
+    assert.ok(framedTokens(tinyRes.summary) < tinyBudget)
   } finally {
     await ctx.fiber.dispose()
   }
