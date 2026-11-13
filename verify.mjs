@@ -895,6 +895,28 @@ await test('buildPolicies: preserves leaner inherited retainRatio when threshold
   assert.equal(unroundedLean[0].retainRatio, undefined)
 })
 
+await test('buildPolicies and apply: preserve tighter thresholds and tolerate null args or BigInt note', () => {
+  const models = [{ provider: 'p', model: 'm', contextWindow: 1000000 }]
+  assert.deepEqual(
+    buildPolicies(models, { forceAtTokens: 262144, minContextWindow: 500000 }, { serviceConfig: { thresholdRatio: 0.2 } }),
+    [],
+  )
+  assert.deepEqual(
+    buildPolicies(models, { forceAtTokens: 262144, minContextWindow: 500000 }, {
+      previousRows: [{ provider: 'p', model: 'm', thresholdRatio: 0.1, retainRatio: 0.05 }],
+      serviceConfig: { thresholdRatio: 0.8 },
+    }),
+    [],
+  )
+  assert.equal(buildPolicies(models, null, null)[0].thresholdRatio, 0.262144)
+
+  const engine = makeEngine()
+  const ctx = fakeCtx({ compaction: engine, llm: makeLlm([]) })
+  ctx.logger.owner = ctx
+  assert.doesNotThrow(() => apply(ctx, { note: 1n }))
+  assert.ok(ctx.logs.some(([level, message]) => level === 'warn' && message.includes('unknown note value 1')))
+})
+
 console.log(`\n${passed} passed, ${failed} failed`)
 if (failed > 0) {
   process.exitCode = 1
