@@ -5,7 +5,7 @@ import * as plugin from './index.js'
 
 assert(process.argv[2], 'Pass the installed DSH node_modules directory')
 const modules = resolve(process.argv[2])
-const { Context } = await import(pathToFileURL(join(modules, '@deepseek-ai/cordis/lib/index.js')))
+const { Context, Service } = await import(pathToFileURL(join(modules, '@deepseek-ai/cordis/lib/index.js')))
 const { BasicCompactionEngine } = await import(pathToFileURL(join(modules, '@deepseek-ai/dsh-compaction-basic/lib/index.js')))
 const flush = () => new Promise(setImmediate)
 const signal = new AbortController().signal
@@ -241,6 +241,40 @@ await test('disposing overlapping instances in FIFO order restores original conf
     assert.equal(engine.config.modelPolicies[0].thresholdRatio, 0.1)
     await second.dispose()
     assert.equal(engine.config, original)
+  } finally { await ctx.fiber.dispose() }
+})
+
+await test('disposing non-extensible Cordis Service proxies in FIFO order restores original config cleanly', async () => {
+  const inner = Object.preventExtensions({
+    config: Object.freeze({ modelPolicies: [] }),
+    async summarize() { return { summary: [{ type: 'text', text: 'Prior work.' }] } },
+  })
+  class BridgeService extends Service {
+    constructor(ctx, opts) {
+      super(ctx, 'compaction')
+      this._inner = opts.inner
+      Object.preventExtensions(this)
+    }
+    get config() { return this._inner.config }
+    set config(value) { this._inner.config = value }
+    summarize(inputArg, agent, sig) { return this._inner.summarize(inputArg, agent, sig) }
+  }
+  const ctx = new Context()
+  await ctx.plugin(BridgeService, { inner })
+  ctx.provide('llm', catalog())
+  try {
+    const scope1 = ctx.isolate('toolResultPruner')
+    const scope2 = ctx.isolate('toolResultPrunerB')
+    assert.notEqual(scope1.get('compaction'), scope2.get('compaction'))
+    const first = await scope1.plugin(plugin, { note: 'off', forceAtTokens: 200000 })
+    await flush()
+    const second = await scope2.plugin(plugin, { note: 'off', forceAtTokens: 100000 })
+    await flush()
+    assert.equal(inner.config.modelPolicies[0].thresholdRatio, 0.1)
+    await first.dispose()
+    assert.equal(inner.config.modelPolicies[0].thresholdRatio, 0.1)
+    await second.dispose()
+    assert.deepEqual(inner.config.modelPolicies, [])
   } finally { await ctx.fiber.dispose() }
 })
 

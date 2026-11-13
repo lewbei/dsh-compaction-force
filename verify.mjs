@@ -1130,6 +1130,51 @@ await test('catalogFor and apply: unwrap Cordis proxy keys, avoid poisoning empt
   }
 })
 
+await test('apply: FIFO disposal across non-extensible Cordis proxies shares receipt tracking without leaking prior rows', async () => {
+  const ORIGINAL = Symbol.for('cordis.original')
+  const targetEngine = Object.preventExtensions(makeEngine())
+  const wrapProxy = (target) => Object.preventExtensions(new Proxy(target, {
+    get(obj, prop, receiver) {
+      if (prop === ORIGINAL) return obj
+      return Reflect.get(obj, prop, receiver)
+    },
+    set(obj, prop, value, receiver) {
+      return Reflect.set(obj, prop, value, receiver)
+    },
+  }))
+  const proxy1 = wrapProxy(targetEngine)
+  const proxy2 = wrapProxy(targetEngine)
+  const llm = makeLlm([{ provider: 'p', model: 'big', window: 1000000 }])
+  const disposers = []
+  const mount = (engineProxy, forceAtTokens) => apply({
+    logs: [],
+    logger: { info() {}, warn() {} },
+    inject(names, cb) {
+      cb({
+        compaction: engineProxy,
+        llm,
+        effect(fn) {
+          const dispose = fn()
+          disposers.push(dispose)
+          return dispose
+        },
+      })
+    },
+  }, { forceAtTokens, minContextWindow: 500000, note: 'off' })
+
+  mount(proxy1, 200000)
+  await tick()
+  mount(proxy2, 100000)
+  await tick()
+  assert.equal(targetEngine.config.modelPolicies[0].thresholdRatio, 0.1)
+
+  disposers[0]()
+  assert.equal(targetEngine.config.modelPolicies[0].thresholdRatio, 0.1)
+
+  disposers[1]()
+  assert.deepEqual(targetEngine.config.modelPolicies, [])
+})
+
 console.log(`\n${passed} passed, ${failed} failed`)
 if (failed > 0) {
   process.exitCode = 1
