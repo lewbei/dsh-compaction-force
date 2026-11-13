@@ -16,55 +16,115 @@
  * restart of that profile (see README "Live mounting").
  */
 import { extname, resolve } from 'node:path'
-import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { readFileSync, statSync, writeFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 
 const PLACEHOLDER = '/path/to/dsh-compaction-force/index.js'
 const templatePath = resolve(fileURLToPath(new URL('../cordis.patch.yml', import.meta.url)))
 
-const args = process.argv.slice(2)
-if (args.length === 0 || args[0] === '--help' || args[0] === '-h') {
+function printUsage() {
   console.error(`Usage: node scripts/prepare-patch.mjs <absolute-path-to-index.js> [--out <file>]
 
 Substitutes the placeholder name in cordis.patch.yml with the absolute path of
 the plugin entry module and prints the resulting patch. Use --out to write it
 to a file instead of stdout. Does not touch any profile, bundle, or server.`)
-  process.exit(args.length === 0 ? 1 : 0)
 }
 
-const source = resolve(args[0])
-if (!existsSync(source)) {
-  console.error(`prepare-patch: module not found: ${source}`)
+const args = process.argv.slice(2)
+if (args.length === 0) {
+  printUsage()
   process.exit(1)
 }
-if (extname(source) !== '.js' || !statSync(source).isFile()) {
+
+let moduleArg = null
+let outArg = null
+let endOfFlags = false
+
+for (let i = 0; i < args.length; i++) {
+  const arg = args[i]
+  if (!endOfFlags && arg === '--') {
+    endOfFlags = true
+    continue
+  }
+  if (!endOfFlags) {
+    if (arg === '--help' || arg === '-h') {
+      printUsage()
+      process.exit(0)
+    }
+    if (arg === '--out' || arg.startsWith('--out=')) {
+      if (outArg !== null) {
+        console.error('prepare-patch: --out specified more than once')
+        process.exit(1)
+      }
+      const next = arg === '--out' ? args[++i] : arg.slice('--out='.length)
+      if (typeof next !== 'string' || next.length === 0 || next.startsWith('-')) {
+        console.error('prepare-patch: --out requires an output file path')
+        process.exit(1)
+      }
+      outArg = next
+      continue
+    }
+    if (arg.startsWith('-')) {
+      console.error(`prepare-patch: unknown option: ${arg}`)
+      process.exit(1)
+    }
+  }
+  if (moduleArg !== null) {
+    console.error(`prepare-patch: unexpected argument: ${arg}`)
+    process.exit(1)
+  }
+  moduleArg = arg
+}
+
+if (moduleArg === null) {
+  printUsage()
+  process.exit(1)
+}
+
+const source = resolve(moduleArg)
+let sourceStat
+try {
+  sourceStat = statSync(source)
+} catch (error) {
+  if (error?.code === 'ENOENT') {
+    console.error(`prepare-patch: module not found: ${source}`)
+  } else {
+    console.error(`prepare-patch: cannot inspect module ${source}: ${error?.message ?? error}`)
+  }
+  process.exit(1)
+}
+if (extname(source) !== '.js' || !sourceStat.isFile()) {
   console.error(`prepare-patch: expected a .js entry module file, got: ${source}`)
   process.exit(1)
 }
 
-const template = readFileSync(templatePath, 'utf8')
+let template
+try {
+  template = readFileSync(templatePath, 'utf8')
+} catch (error) {
+  console.error(`prepare-patch: cannot read template ${templatePath}: ${error?.message ?? error}`)
+  process.exit(1)
+}
 if (!template.includes(PLACEHOLDER)) {
   console.error(`prepare-patch: template ${templatePath} no longer contains the placeholder ${PLACEHOLDER}`)
   process.exit(1)
 }
-// Double-quote the interpolated name: a plain YAML scalar is invalid when the
-// path contains a colon-space (e.g. "c: d/index.js").
-const quotedPath = `"${source.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`
+
+const quotedPath = JSON.stringify(source)
 const patch = template.split(PLACEHOLDER).join(quotedPath)
 if (!patch.includes(`name: ${quotedPath}`) || !patch.includes('id: compaction-force')) {
   console.error('prepare-patch: generated patch is missing the expected row structure')
   process.exit(1)
 }
 
-const outIndex = args.indexOf('--out')
-if (outIndex !== -1) {
-  const outArg = args[outIndex + 1]
-  if (typeof outArg !== 'string' || outArg.length === 0 || outArg.startsWith('--')) {
-    console.error('prepare-patch: --out requires an output file path')
+if (outArg !== null) {
+  const out = resolve(outArg)
+  try {
+    writeFileSync(out, patch)
+  } catch (error) {
+    console.error(`prepare-patch: failed to write ${out}: ${error?.message ?? error}`)
     process.exit(1)
   }
-  const out = resolve(outArg)
-  writeFileSync(out, patch)
   console.log(`prepared patch written to ${out}`)
 } else {
   process.stdout.write(patch)

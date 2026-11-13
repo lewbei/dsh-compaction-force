@@ -89,12 +89,58 @@ try {
   const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
   assert((pkg.files ?? []).includes('scripts/prepare-patch.mjs'), 'package must ship prepare-patch')
   assert((pkg.files ?? []).includes('verify-install.mjs'), 'package must ship verify-install')
-  ok('package.json includes the prepare and verification scripts')
+  const bundlePatchRel = pkg.dsh?.bundle?.patch
+  assert.equal(typeof bundlePatchRel, 'string', 'package must declare dsh.bundle.patch')
+  assert((pkg.files ?? []).includes(bundlePatchRel.replace(/^\.\//, '')), 'package.json files must include dsh.bundle.patch')
+  const bundlePatchText = readFileSync(join(root, bundlePatchRel), 'utf8')
+  assert(!bundlePatchText.includes('/path/to/dsh-compaction-force/index.js'), 'bundle patch must not contain placeholder path')
+  assert(/name:\s*(?:\.\/index\.js|"@local\/dsh-compaction-force"|@local\/dsh-compaction-force)\b/.test(bundlePatchText), 'bundle patch must resolve to packaged entry module')
+  ok('package.json includes prepare, verification, and valid bundle patch')
 
   const missingOut = spawnSync(node, [join(root, 'scripts/prepare-patch.mjs'), fixtureModule, '--out'], { encoding: 'utf8' })
   assert.notEqual(missingOut.status, 0, '--out without argument must exit non-zero')
   assert(!/TypeError/.test(missingOut.stderr), '--out without argument must fail cleanly without TypeError')
   ok('prepare-patch rejects --out without a path cleanly')
+
+  const outFirst = join(fixture, 'out-first.patch.yml')
+  const outFirstRun = spawnSync(node, [join(root, 'scripts/prepare-patch.mjs'), '--out', outFirst, fixtureModule], { encoding: 'utf8' })
+  assert.equal(outFirstRun.status, 0, outFirstRun.stderr)
+  assert.equal(readFileSync(outFirst, 'utf8'), patch)
+
+  const outEq = join(fixture, 'out-eq.patch.yml')
+  const outEqRun = spawnSync(node, [join(root, 'scripts/prepare-patch.mjs'), fixtureModule, `--out=${outEq}`], { encoding: 'utf8' })
+  assert.equal(outEqRun.status, 0, outEqRun.stderr)
+  assert.equal(readFileSync(outEq, 'utf8'), patch)
+
+  const helpSecond = spawnSync(node, [join(root, 'scripts/prepare-patch.mjs'), fixtureModule, '--help'], { encoding: 'utf8' })
+  assert.equal(helpSecond.status, 0, helpSecond.stderr)
+  assert(!helpSecond.stdout.includes('id: compaction-force'))
+
+  const unknownFlag = spawnSync(node, [join(root, 'scripts/prepare-patch.mjs'), fixtureModule, '--bogus-flag'], { encoding: 'utf8' })
+  assert.notEqual(unknownFlag.status, 0, 'unknown flag must fail')
+
+  const dashOut = spawnSync(node, [join(root, 'scripts/prepare-patch.mjs'), fixtureModule, '--out', '-h'], { encoding: 'utf8', cwd: fixture })
+  assert.notEqual(dashOut.status, 0, '--out -h must fail')
+  assert(!existsSync(join(fixture, '-h')), '--out -h must not create a file named -h')
+
+  const missingDirOut = spawnSync(node, [join(root, 'scripts/prepare-patch.mjs'), fixtureModule, '--out', join(fixture, 'missing-dir', 'out.yml')], { encoding: 'utf8' })
+  assert.notEqual(missingDirOut.status, 0)
+  assert(!/at Object\.writeFileSync|node:fs:\d+/.test(missingDirOut.stderr), 'missing parent dir should fail without stacktrace')
+
+  const dirOutTarget = join(fixture, 'out-dir')
+  mkdirSync(dirOutTarget)
+  const dirOutRun = spawnSync(node, [join(root, 'scripts/prepare-patch.mjs'), fixtureModule, '--out', dirOutTarget], { encoding: 'utf8' })
+  assert.notEqual(dirOutRun.status, 0)
+  assert(!/at Object\.writeFileSync|node:fs:\d+/.test(dirOutRun.stderr), 'directory --out target should fail without stacktrace')
+
+  const nlDir = join(fixture, 'dir\n  injected: oops\n#x')
+  mkdirSync(nlDir, { recursive: true })
+  const nlModule = join(nlDir, 'index.js')
+  writeFileSync(nlModule, 'export const name = "compaction-force"\n')
+  const nlRun = spawnSync(node, [join(root, 'scripts/prepare-patch.mjs'), nlModule], { encoding: 'utf8' })
+  assert.equal(nlRun.status, 0, nlRun.stderr)
+  assert(nlRun.stdout.includes(`name: ${JSON.stringify(nlModule)}`), 'newline path must be JSON-escaped inside YAML scalar')
+  ok('prepare-patch handles flag ordering, = syntax, help, unknown flags, write errors, and newline paths')
 
   const missingProfile = spawnSync(node, [join(root, 'catalog-report.mjs'), '--profile'], { encoding: 'utf8' })
   assert.notEqual(missingProfile.status, 0, '--profile without argument must exit non-zero')
