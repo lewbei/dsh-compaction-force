@@ -834,13 +834,13 @@ function splitSCCandidates(
  * @returns {string[]} de-duplicated constraint clauses (each trimmed, <=240 chars).
  */
 export function extractSideConstraints(messages, options = {}) {
-  const constraintRe = /\b(don'?t|do not|never|always|must(?:\s+not)?|should(?:\s+not)?|before (?:you|any)|wait for (?:my|your)|confirm (?:with|before)|ask (?:me|before)|show me (?:the|what)|until i (?:say|tell|confirm)|unless i|only (?:when|if|after)|no (?:emails?|messages?|files?|changes?|deletions?|emails|sending)|avoid|prevent|ensure (?:that|you)|require(?:d)? (?:that|to)|from now on|for the rest of (?:this )?session)\b/i
+  const constraintRe = /\b(don['’]?t|do not|never|always|cannot|can['’]?t|must(?:\s+not)?|mustn['’]?t|should(?:\s+not)?|shouldn['’]?t|before (?:you|any)|wait for (?:my|your)|confirm (?:with|before)|ask (?:me|before)|show me (?:the|what)|until i (?:say|tell|confirm)|unless i|only (?:when|if|after)|no (?:emails?|messages?|files?|changes?|deletions?|emails|sending)|avoid|prevent|ensure (?:that|you)|require(?:d)? (?:that|to)|from now on|for the rest of (?:this )?session)\b/i
   const sanitizedHeading = normalizeHeading(options?.heading)
   const customHeading = (sanitizedHeading.length > 0 ? sanitizedHeading : DEFAULTS.heading).toLowerCase()
   const seen = new Set()
-  const fresh = []
-  const prior = []
-  const stage = (candidate, fromPrior) => {
+  const out = []
+  const stage = (candidate) => {
+    if (out.length >= 8) return
     if (candidate.length < 8) return
     if (/\?["'”’)\]\s]*$/.test(candidate)) return
     const lower = candidate.toLowerCase()
@@ -849,18 +849,18 @@ export function extractSideConstraints(messages, options = {}) {
     // Match against the full text; store a truncated copy for over-long
     // single-line candidates instead of dropping them.
     if (!constraintRe.test(candidate)) return
-    const display = candidate.length > 400 ? `${candidate.slice(0, 397)}...` : candidate
+    const item = truncateBalanced(candidate, 240, '...')
     // Dedup ignoring trailing punctuation ("Never deploy." ≡ "never deploy!").
-    const key = lower.replace(/[!?.,;:]+$/g, '')
+    const key = item.toLowerCase().replace(/[!?.,;:]+$/g, '')
     if (seen.has(key)) return
     seen.add(key)
-    const item = display.length > 240 ? `${display.slice(0, 237)}...` : display
-    ;(fromPrior ? prior : fresh).push(item)
+    out.push(item)
   }
   // Scan newest messages first so the 8-slot cap keeps the freshest constraints
   // (the ones most likely to still bind), instead of silently dropping them.
   const list = Array.isArray(messages) ? messages : []
   for (let index = list.length - 1; index >= 0; index -= 1) {
+    if (out.length >= 8) break
     const msg = list[index]
     if (msg === null || typeof msg !== 'object') continue
     if (msg.role !== 'user') continue
@@ -878,8 +878,11 @@ export function extractSideConstraints(messages, options = {}) {
       authorizedPriorHeadingIdx: -1,
       headingOrdinal: -1,
     }
+    const msgFresh = []
+    const msgPrior = []
     const stageCandidate = ({ text, prior: fromPrior }) => {
-      stage(text.replace(/\s+/g, ' ').trim(), fromPrior)
+      const normalized = text.replace(/\s+/g, ' ').trim()
+      if (normalized.length > 0) (fromPrior ? msgPrior : msgFresh).push(normalized)
     }
     const flushStateBuffers = () => {
       const tail = []
@@ -905,14 +908,8 @@ export function extractSideConstraints(messages, options = {}) {
       }
     }
     flushStateBuffers()
-  }
-  // New/fresh constraints win the cap; prior constraints from the previous
-  // checkpoint are carried forward into the remaining slots so a lossy
-  // summarizer cannot erase them across compactions.
-  const out = fresh.slice(0, 8)
-  for (const item of prior) {
-    if (out.length >= 8) break
-    out.push(item)
+    for (const candidate of msgFresh) stage(candidate)
+    for (const candidate of msgPrior) stage(candidate)
   }
   return out
 }
