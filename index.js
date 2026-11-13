@@ -432,42 +432,65 @@ const SC_AUTHORITY_LINE = 'this checkpoint is the authoritative record of that s
 const COMPACT_OPEN_TAG = '<compacted-summary>'
 const COMPACT_CLOSE_TAG = '</compacted-summary>'
 
-function splitMessageSegments(texts) {
-  const segments = []
-  let inSummary = false
-  const hasClosingAhead = (blockIdx, startOffset) => {
-    if (texts[blockIdx].toLowerCase().indexOf(COMPACT_CLOSE_TAG, startOffset) !== -1) return true
-    for (let i = blockIdx + 1; i < texts.length; i += 1) {
-      if (texts[i].toLowerCase().includes(COMPACT_CLOSE_TAG)) return true
-    }
-    return false
-  }
+function frameSummarySpans(texts) {
+  const entries = []
   for (let blockIdx = 0; blockIdx < texts.length; blockIdx += 1) {
-    const raw = texts[blockIdx]
-    const lower = raw.toLowerCase()
-    let cursor = 0
-    while (cursor < raw.length) {
-      if (!inSummary) {
-        const openAt = lower.indexOf(COMPACT_OPEN_TAG, cursor)
-        if (openAt === -1 || !hasClosingAhead(blockIdx, openAt + COMPACT_OPEN_TAG.length)) {
-          segments.push({ text: raw.slice(cursor), inSummary: false })
-          break
-        }
-        if (openAt > cursor) segments.push({ text: raw.slice(cursor, openAt), inSummary: false })
-        inSummary = true
-        cursor = openAt + COMPACT_OPEN_TAG.length
-      } else {
-        const closeAt = lower.indexOf(COMPACT_CLOSE_TAG, cursor)
-        if (closeAt === -1) {
-          segments.push({ text: raw.slice(cursor), inSummary: true })
-          break
-        }
-        if (closeAt > cursor) segments.push({ text: raw.slice(cursor, closeAt), inSummary: true })
-        inSummary = false
-        cursor = closeAt + COMPACT_CLOSE_TAG.length
-      }
+    for (const line of scanBlockLines(texts[blockIdx])) {
+      entries.push({ blockIdx, ...line })
     }
   }
+  const openStack = []
+  const delimiters = new Set()
+  const spans = []
+  for (let idx = 0; idx < entries.length; idx += 1) {
+    const entry = entries[idx]
+    if (entry.inFence) continue
+    const lower = entry.trimmed.toLowerCase()
+    if (lower === COMPACT_OPEN_TAG) {
+      openStack.push(idx)
+    } else if (lower === COMPACT_CLOSE_TAG && openStack.length > 0) {
+      const start = openStack.pop()
+      delimiters.add(start)
+      delimiters.add(idx)
+      spans.push([start, idx])
+    }
+  }
+  spans.sort((a, b) => a[0] - b[0] || a[1] - b[1])
+  const inSummary = new Array(entries.length).fill(false)
+  let maxEnd = -1
+  let spanIdx = 0
+  for (let idx = 0; idx < entries.length; idx += 1) {
+    while (spanIdx < spans.length && spans[spanIdx][0] <= idx) {
+      if (spans[spanIdx][1] > maxEnd) maxEnd = spans[spanIdx][1]
+      spanIdx += 1
+    }
+    if (idx < maxEnd && !delimiters.has(idx)) inSummary[idx] = true
+  }
+  const segments = []
+  let activeBlock = -1
+  let activeInSummary = false
+  let lines = []
+  const flush = () => {
+    if (lines.length === 0) return
+    segments.push({ text: lines.join('\n'), inSummary: activeInSummary })
+    lines = []
+  }
+  for (let idx = 0; idx < entries.length; idx += 1) {
+    if (delimiters.has(idx)) {
+      flush()
+      activeBlock = -1
+      continue
+    }
+    const { blockIdx, rawLine } = entries[idx]
+    const flag = inSummary[idx]
+    if (blockIdx !== activeBlock || flag !== activeInSummary) {
+      flush()
+      activeBlock = blockIdx
+      activeInSummary = flag
+    }
+    lines.push(rawLine)
+  }
+  flush()
   return segments
 }
 
@@ -619,7 +642,7 @@ export function extractSideConstraints(messages, options = {}) {
       .filter((block) => block !== null && typeof block === 'object' && typeof block.text === 'string')
       .map((block) => block.text)
     const state = { inSummary: false, section: 'none' }
-    for (const seg of splitMessageSegments(texts)) {
+    for (const seg of frameSummarySpans(texts)) {
       state.inSummary = seg.inSummary
       state.section = seg.inSummary ? (state.section === 'prior' ? 'prior' : 'synthetic') : 'none'
       for (const { text, prior: fromPrior } of splitSCCandidates(seg.text, syntheticHeadings, state)) {
