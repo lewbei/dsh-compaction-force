@@ -1345,6 +1345,62 @@ await test('apply: multi-instance wrapper ownership survives FIFO disposal, opti
   assert.match(afterOverlay.summary[1].text, /Note to Self \(context\)/)
 })
 
+await test('buildNoteText and wrapSummarize: exact small token formatting, text-only blocks, requestHeader forwarding, and engine meter fallback', async () => {
+  assert.match(buildNoteText({ variant: 'context', totalTokens: 0 }), /compacted at the context limit/)
+  assert.match(buildNoteText({ variant: 'context', totalTokens: 77 }), /~77 tokens\./)
+  assert.match(buildNoteText({ variant: 'context', totalTokens: 999 }), /~999 tokens\./)
+  assert.match(buildNoteText({ variant: 'context', totalTokens: 1000 }), /~1K tokens\./)
+
+  const engineWithNonText = makeEngine('## Current Work\n- real text\n## Next Step\n- run tests')
+  engineWithNonText.summarize = async () => ({
+    summary: [
+      { type: 'reasoning', text: '## Current Work\n- secret reasoning\n## Next Step\n- leak reasoning' },
+      { type: 'custom', text: '## Critical Context\n- leaked custom field' },
+      { type: 'text', text: '## Current Work\n- visible work\n## Next Step\n- finish check' },
+    ],
+    rawOutput: [],
+    provider: 'fake',
+    model: 'fake',
+  })
+  const calls = []
+  const expectedHeader = { config: { provider: 'test', model: 'large' }, tools: [{ name: 't' }] }
+  const meter = {
+    measure(...args) {
+      calls.push(args)
+      return { totalTokens: args[1] ? 4200 : 1000 }
+    },
+  }
+  const isolatedCtx = fakeCtx({ tokenMeter: undefined })
+  engineWithNonText.ctx = fakeCtx({ tokenMeter: meter })
+  wrapSummarize(engineWithNonText, isolatedCtx, { note: 'both' })
+
+  const sessWithHeader = { requestHeader: () => expectedHeader }
+  const resWithHeader = await engineWithNonText.summarize({}, { session: sessWithHeader }, undefined)
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].length, 2)
+  assert.equal(calls[0][0], sessWithHeader)
+  assert.equal(calls[0][1], expectedHeader)
+  assert.match(resWithHeader.summary[3].text, /~4K tokens on /)
+  assert.match(resWithHeader.summary[3].text, /Where I was: visible work/)
+  assert.doesNotMatch(resWithHeader.summary[3].text, /secret reasoning|leak reasoning|leaked custom field/)
+
+  const sessWithoutHeader = {}
+  const resWithoutHeader = await engineWithNonText.summarize({}, { session: sessWithoutHeader }, undefined)
+  assert.equal(calls.length, 2)
+  assert.equal(calls[1].length, 1)
+  assert.match(resWithoutHeader.summary[3].text, /~1K tokens on /)
+
+  const throwingSess = { requestHeader() { throw new Error('bad header') } }
+  const resThrowing = await engineWithNonText.summarize({}, { session: throwingSess }, undefined)
+  assert.match(resThrowing.summary[3].text, /compacted at the context limit/)
+
+  const primaryEngine = makeEngine('## Current Work\n- primary')
+  primaryEngine.ctx = fakeCtx({ tokenMeter: { measure: () => ({ totalTokens: 9000 }) } })
+  wrapSummarize(primaryEngine, fakeCtx({ tokenMeter: { measure: () => ({ totalTokens: 3000 }) } }), { note: 'context' })
+  const resPrimary = await primaryEngine.summarize({}, { session: {} }, undefined)
+  assert.match(resPrimary.summary[1].text, /~3K tokens on /)
+})
+
 console.log(`\n${passed} passed, ${failed} failed`)
 if (failed > 0) {
   process.exitCode = 1

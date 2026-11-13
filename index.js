@@ -529,7 +529,7 @@ export function buildNoteText({ variant, heading = DEFAULTS.heading, summaryText
   const parts = []
   if (variant === 'context' || variant === 'both') {
     const size = Number.isInteger(totalTokens) && totalTokens > 0
-      ? `~${Math.round(totalTokens / 1000)}K tokens`
+      ? (totalTokens >= 1000 ? `~${Math.round(totalTokens / 1000)}K tokens` : `~${totalTokens} tokens`)
       : 'the context limit'
     const when = typeof timestamp === 'string' && timestamp.length > 0 ? ` on ${timestamp}` : ''
     parts.push([
@@ -562,12 +562,20 @@ export function buildNoteText({ variant, heading = DEFAULTS.heading, summaryText
   return parts.length === 0 ? '' : `\n\n${parts.join('\n\n')}\n`
 }
 
-/** Measure the session's current tokens, tolerating a missing/broken meter. */
-function measureTokens(ctx, agent) {
+function readMeter(ctx) {
+  return typeof ctx?.get === 'function' ? ctx.get('tokenMeter') : ctx?.tokenMeter
+}
+
+function resolveMeter(ctx, engine) {
+  return readMeter(ctx) ?? readMeter(unwrapService(engine)?.ctx)
+}
+
+function measureTokens(ctx, engine, agent) {
   try {
-    const meter = typeof ctx?.get === 'function' ? ctx.get('tokenMeter') : ctx?.tokenMeter
+    const meter = resolveMeter(ctx, engine)
     if (meter === null || meter === undefined || typeof meter.measure !== 'function') return null
-    const measurement = meter.measure(agent?.session)
+    const header = typeof agent?.session?.requestHeader === 'function' ? agent.session.requestHeader() : undefined
+    const measurement = header !== undefined ? meter.measure(agent?.session, header) : meter.measure(agent?.session)
     const total = measurement?.totalTokens
     return Number.isInteger(total) && total > 0 ? total : null
   } catch {
@@ -606,7 +614,8 @@ function mountSummary(engine, ctx, options = {}) {
     const top = layers.at(-1)
     if (!top || top.options.note === 'off' || !isObjectRecord(result) || !Array.isArray(result.summary)) return result
     const summaryText = result.summary
-      .map((block) => (block !== null && typeof block === 'object' && typeof block.text === 'string' ? block.text : ''))
+      .filter((block) => block !== null && typeof block === 'object' && block.type === 'text' && typeof block.text === 'string')
+      .map((block) => block.text)
       .join('\n')
     const sideConstraints = top.options.scExtract === 'pattern'
       ? extractSideConstraints(Array.isArray(input?.messages) ? input.messages : [], { heading: top.options.heading })
@@ -615,7 +624,7 @@ function mountSummary(engine, ctx, options = {}) {
       variant: top.options.note,
       heading: top.options.heading,
       summaryText,
-      totalTokens: measureTokens(top.ctx, agent),
+      totalTokens: measureTokens(top.ctx, target, agent),
       timestamp: new Date().toISOString(),
       sideConstraints,
     })
