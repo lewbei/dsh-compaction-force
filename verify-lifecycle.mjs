@@ -204,5 +204,60 @@ await test('remount wins over a disposed installation sharing the pending catalo
   } finally { release(); await ctx.fiber.dispose() }
 })
 
+await test('activates and installs policies when tokenMeter is absent and resolves late tokenMeter', async () => {
+  const ctx = new Context()
+  const engine = new BasicCompactionEngine(ctx, { auto: false })
+  engine.summarize = async () => ({ summary: [{ type: 'text', text: 'Prior work.' }] })
+  ctx.provide('llm', catalog())
+  try {
+    const fiber = ctx.plugin(plugin, { note: 'context', forceAtTokens: 200000 })
+    await fiber
+    await flush()
+    assert.equal(engine.config.modelPolicies.length, 1)
+    assert.equal(engine.config.modelPolicies[0].thresholdRatio, 0.2)
+    const noMeter = await engine.summarize(input, {}, signal)
+    assert.match(noMeter.summary[1].text, /compacted at the context limit/)
+    ctx.provide('tokenMeter', { measure: () => ({ totalTokens: 42000 }) })
+    await flush()
+    const withMeter = await engine.summarize(input, {}, signal)
+    assert.match(withMeter.summary[1].text, /compacted at ~42K tokens/)
+    await fiber.dispose()
+  } finally { await ctx.fiber.dispose() }
+})
+
+await test('disposing overlapping instances in FIFO order restores original config without zombie policies', async () => {
+  const { ctx, engine } = fixture()
+  const original = engine.config
+  try {
+    const first = ctx.plugin(plugin, { forceAtTokens: 200000 })
+    await first
+    await flush()
+    assert.equal(engine.config.modelPolicies[0].thresholdRatio, 0.2)
+    const second = ctx.plugin(plugin, { forceAtTokens: 100000 })
+    await second
+    await flush()
+    assert.equal(engine.config.modelPolicies[0].thresholdRatio, 0.1)
+    await first.dispose()
+    assert.equal(engine.config.modelPolicies[0].thresholdRatio, 0.1)
+    await second.dispose()
+    assert.equal(engine.config, original)
+  } finally { await ctx.fiber.dispose() }
+})
+
+await test('tiny forceAtTokens policies never trigger TargetPressureConfigError during compactPressure', async () => {
+  for (const [forceAtTokens, window] of [[1, 700000], [2, 600000]]) {
+    const ctx = new Context()
+    const engine = new BasicCompactionEngine(ctx, { auto: false })
+    ctx.provide('tokenMeter', { measure: () => ({ totalTokens: 0 }) })
+    ctx.provide('llm', {
+      resolveModelInfo: async () => ({ context: { contextWindow: window }, defaultMaxTokens: 1000 }),
+    })
+    const policies = plugin.buildPolicies([{ provider: 'test', model: 'large', contextWindow: window }], { forceAtTokens })
+    engine.config = Object.freeze({ ...engine.config, modelPolicies: policies })
+    const result = await engine.compactPressure({ session: { surface: {} } }, { config: { provider: 'test', model: 'large' } }, signal, false)
+    assert.equal(result, null)
+  }
+})
+
 console.log(`${passed} passed, ${failed} failed (real Cordis lifecycle and shipped engine; controlled catalog and summarizer)`)
 if (failed) process.exitCode = 1

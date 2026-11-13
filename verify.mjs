@@ -309,7 +309,7 @@ await test('apply: injects compaction+llm, wraps summarize and installs policies
   const ctx = fakeCtx({ compaction: engine, llm, tokenMeter: { measure: () => ({ totalTokens: 5000 }) } })
   ctx.logger.owner = ctx
   apply(ctx, { forceAtTokens: 262144, minContextWindow: 500000, note: 'context' })
-  assert.deepEqual(ctx.names, ['compaction', 'llm', 'tokenMeter'])
+  assert.deepEqual(ctx.names, ['compaction', 'llm'])
   await tick()
   await tick()
   assert.equal(engine.config.modelPolicies.length, 1)
@@ -693,6 +693,175 @@ await test('apply: with no llm service installs nothing and does not crash', asy
 await test('plugin module has the expected name', async () => {
   const module = await import('./index.js')
   assert.equal(module.name, 'compaction-force')
+})
+
+await test('extractSideConstraints: ignores framed <compacted-summary> sections across blocks and keeps prior constraints', () => {
+  const summaryBody = [
+    '## Primary Request and Intent',
+    '- We must support multi-tenant isolation.',
+    '- The system should not expose internal metrics.',
+    '## Key Technical Concepts',
+    '- We must ensure connection pooling is configured properly.',
+    '- Microservices should avoid tight coupling.',
+    '## Errors and Fixes',
+    '- Connection timeout: should not use default pool size of 5.',
+    '- Migration failed: must not run without transaction wrapper.',
+    '- Auth bug: avoid caching invalid JWT tokens.',
+    '- Redis sync: prevent stale cache reads by invalidating on write.',
+    '## Critical Context',
+    '- Avoid modifying production config without peer review.',
+  ].join('\n')
+  const noteBlock = buildNoteText({
+    variant: 'both',
+    summaryText: summaryBody,
+    totalTokens: 120000,
+    sideConstraints: ['Never deploy without explicit approval.', 'Always ask before deleting any file.'],
+  })
+  const checkpointMessage = {
+    role: 'user',
+    content: [
+      { type: 'text', text: 'Automatically generated checkpoint.\n\n<compacted-summary>' },
+      { type: 'text', text: summaryBody },
+      { type: 'text', text: noteBlock },
+      { type: 'text', text: '</compacted-summary>\nNever push to main.' },
+    ],
+  }
+  const extracted = extractSideConstraints([checkpointMessage])
+  assert.deepEqual(extracted, [
+    'Never push to main.',
+    'Never deploy without explicit approval.',
+    'Always ask before deleting any file.',
+  ])
+  assert.deepEqual(
+    extractSideConstraints([{ role: 'user', content: [{ type: 'text', text: 'Inspect <compacted-summary> format.\nAlways validate inputs.' }] }]),
+    ['Always validate inputs.'],
+  )
+})
+
+await test('extractSideConstraints: preserves wrapped multi-line user sentences', () => {
+  const text = 'Please help me with deployment.\nAlways deploy changes\nto the staging server only.'
+  const extracted = extractSideConstraints([{ role: 'user', content: [{ type: 'text', text }] }])
+  assert.deepEqual(extracted, ['Always deploy changes to the staging server only.'])
+})
+
+await test('extractSideConstraints: skips indented continuations inside synthetic notes', () => {
+  const block = [
+    '## Note to Self (handoff)',
+    '- Where I was: Refactoring auth.',
+    '  We must ensure all security checks pass before deployment.',
+    '- Next: Run the verification suite.',
+  ].join('\n')
+  assert.deepEqual(extractSideConstraints([{ role: 'user', content: [{ type: 'text', text: block }] }]), [])
+})
+
+await test('wrapSummarize: uses normalized defaults when options are omitted or partial', async () => {
+  const input = { messages: [{ role: 'user', content: [{ type: 'text', text: 'Never deploy without approval.' }] }] }
+  const defaultsEngine = makeEngine()
+  assert.equal(wrapSummarize(defaultsEngine, fakeCtx({})), true)
+  const defRes = await defaultsEngine.summarize(input, { session: {} })
+  assert.equal(defRes.summary.length, 2)
+  assert.match(defRes.summary[1].text, /Note to Self \(handoff\)/)
+  assert.match(defRes.summary[1].text, /Never deploy without approval\./)
+
+  const partialEngine = makeEngine()
+  assert.equal(wrapSummarize(partialEngine, fakeCtx({}), { note: 'handoff' }), true)
+  const partRes = await partialEngine.summarize(input, { session: {} })
+  assert.match(partRes.summary[1].text, /Active Constraints \(preserve these\)/)
+  assert.match(partRes.summary[1].text, /Never deploy without approval\./)
+})
+
+await test('buildPolicies: avoids zero-token thresholds and retain >= threshold collisions', () => {
+  assert.deepEqual(buildPolicies([{ provider: 'p', model: 'm700k', contextWindow: 700000 }], { forceAtTokens: 1 }), [])
+  const tiny = buildPolicies([{ provider: 'p', model: 'm600k', contextWindow: 600000 }], { forceAtTokens: 2 })
+  assert.equal(tiny.length, 1)
+  const thresholdTokens = Math.floor(600000 * tiny[0].thresholdRatio)
+  const retainTokens = Math.floor(600000 * tiny[0].retainRatio)
+  assert.ok(thresholdTokens >= 1, `expected thresholdTokens >= 1, got ${thresholdTokens}`)
+  assert.ok(retainTokens < thresholdTokens, `expected retainTokens (${retainTokens}) < thresholdTokens (${thresholdTokens})`)
+  const inheritedCollision = buildPolicies(
+    [{ provider: 'p', model: 'm600k1', contextWindow: 600001 }],
+    { forceAtTokens: 96001 },
+    { serviceConfig: { retainRatio: 0.16 } },
+  )
+  assert.equal(inheritedCollision.length, 1)
+  assert.ok(
+    Math.floor(600001 * inheritedCollision[0].retainRatio) < Math.floor(600001 * inheritedCollision[0].thresholdRatio),
+    'inherited 0.16 colliding with floor(600001 * 0.160001) must emit a lower explicit retainRatio',
+  )
+})
+
+await test('apply: tolerates malformed null rows inside commit path and self-heals', async () => {
+  const engine = makeEngine()
+  engine.config = Object.freeze({ ...engine.config, modelPolicies: [null, { provider: 'x', model: 'y', thresholdRatio: 0.7 }] })
+  const llm = makeLlm([{ provider: 'a', model: 'big', window: 1000000 }])
+  const ctx = fakeCtx({ compaction: engine, llm })
+  ctx.logger.owner = ctx
+  apply(ctx, { forceAtTokens: 262144, minContextWindow: 500000 })
+  await tick()
+  await tick()
+  assert.deepEqual(engine.config.modelPolicies, [
+    { provider: 'x', model: 'y', thresholdRatio: 0.7 },
+    { provider: 'a', model: 'big', thresholdRatio: 0.262144 },
+  ])
+})
+
+await test('apply: FIFO and partial-overlap disposal of instances leaves no zombie policy', async () => {
+  const engine = makeEngine()
+  const llm = makeLlm([{ provider: 'a', model: 'big', window: 1000000 }])
+  const disposers = []
+  const makeCtx = (svcLlm = llm) => ({
+    logs: [],
+    logger: { info() {}, warn() {} },
+    inject(_names, cb) {
+      cb({
+        compaction: engine,
+        llm: svcLlm,
+        effect(setup) {
+          disposers.push(setup())
+        },
+      })
+    },
+  })
+  apply(makeCtx(), { forceAtTokens: 200000 })
+  await tick()
+  await tick()
+  assert.equal(engine.config.modelPolicies[0].thresholdRatio, 0.2)
+  apply(makeCtx(), { forceAtTokens: 100000 })
+  await tick()
+  await tick()
+  assert.equal(engine.config.modelPolicies[0].thresholdRatio, 0.1)
+  disposers[0]()
+  assert.equal(engine.config.modelPolicies[0].thresholdRatio, 0.1)
+  disposers[1]()
+  assert.deepEqual(engine.config.modelPolicies, [])
+
+  const partialDisposers = []
+  const makePartialCtx = (models) => ({
+    logs: [],
+    logger: { info() {}, warn() {} },
+    inject(_names, cb) {
+      cb({
+        compaction: engine,
+        llm: makeLlm(models),
+        effect(setup) {
+          partialDisposers.push(setup())
+        },
+      })
+    },
+  })
+  apply(makePartialCtx([{ provider: 'p', model: 'mA', window: 1000000 }, { provider: 'p', model: 'mB', window: 1000000 }]), { forceAtTokens: 300000 })
+  await tick(); await tick()
+  apply(makePartialCtx([{ provider: 'p', model: 'mA', window: 1000000 }]), { forceAtTokens: 200000 })
+  await tick(); await tick()
+  apply(makePartialCtx([{ provider: 'p', model: 'mB', window: 1000000 }]), { forceAtTokens: 100000 })
+  await tick(); await tick()
+  partialDisposers[1]()
+  assert.equal(engine.config.modelPolicies.find((r) => r.model === 'mA').thresholdRatio, 0.3)
+  assert.equal(engine.config.modelPolicies.find((r) => r.model === 'mB').thresholdRatio, 0.1)
+  partialDisposers[0]()
+  assert.deepEqual(engine.config.modelPolicies.map((r) => [r.model, r.thresholdRatio]), [['mB', 0.1]])
+  partialDisposers[2]()
+  assert.deepEqual(engine.config.modelPolicies, [])
 })
 
 console.log(`\n${passed} passed, ${failed} failed`)

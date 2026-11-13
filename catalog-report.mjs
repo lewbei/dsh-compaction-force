@@ -23,6 +23,10 @@ import { buildPolicies } from './index.js'
 const args = process.argv.slice(2)
 const profileFlag = args.indexOf('--profile')
 const profile = profileFlag === -1 ? 'web' : args[profileFlag + 1]
+if (profileFlag !== -1 && (typeof profile !== 'string' || profile.length === 0 || profile.startsWith('--'))) {
+  console.error('catalog-report: --profile requires a profile name')
+  process.exit(1)
+}
 const HEADROOM = 65536
 // dsh-llm-deepseek routes carry their models from the adapter, not the composed
 // profile. Values observed through a real headless enumeration (2026-11-12):
@@ -56,9 +60,12 @@ function installRoot() {
 const root = installRoot()
 const require = createRequire(join(root, 'resolve-from-root.cjs'))
 const yaml = require('yaml')
-const dump = spawnSync('dsh', ['--profile', profile, '--dump-config'], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })
+const localDsh = join(root, '.bin', 'dsh')
+const dshBin = existsSync(localDsh) ? localDsh : 'dsh'
+const dump = spawnSync(dshBin, ['--profile', profile, '--dump-config'], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })
 if (dump.status !== 0) {
-  console.error(`dsh --profile ${profile} --dump-config failed: ${String(dump.stderr).slice(0, 400)}`)
+  const detail = dump.error ? dump.error.message : String(dump.stderr || '')
+  console.error(`dsh --profile ${profile} --dump-config failed: ${detail.slice(0, 400)}`)
   process.exit(1)
 }
 const composed = yaml.parseDocument(dump.stdout).toJS()

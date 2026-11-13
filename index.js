@@ -45,6 +45,7 @@ export const DEFAULTS = Object.freeze({
 
 const NOTE_VARIANTS = new Set(['off', 'context', 'handoff', 'both'])
 const WRAPPED = Symbol.for('@local/dsh-compaction-force/wrapped')
+const RECEIPTS = Symbol.for('@local/dsh-compaction-force/receipts')
 const CATALOG_TTL_MS = 5 * 60 * 1000
 
 /** Cached provider/model catalog per llm service, with an in-flight promise. */
@@ -74,10 +75,16 @@ const round6 = (value) => Math.round(value * 1e6) / 1e6
 /** Shipped retention ratio assumed when a config row or service default omits it. */
 const DEFAULT_RETAIN_RATIO = 0.16
 
+const isObjectRecord = (value) => value !== null && typeof value === 'object'
+
 /** Bound an emitted retention so it is strictly below the threshold and positive. */
-const validRetention = (thresholdRatio) => {
+const validRetention = (thresholdRatio, window) => {
   const halved = round6(thresholdRatio / 2)
-  return halved > 0 && halved < thresholdRatio ? halved : thresholdRatio / 2
+  if (halved <= 0 || halved >= thresholdRatio) return thresholdRatio / 2
+  if (Number.isInteger(window) && Math.floor(window * halved) >= Math.floor(window * thresholdRatio)) {
+    return thresholdRatio / 2
+  }
+  return halved
 }
 
 /**
@@ -117,7 +124,8 @@ export function buildPolicies(models, options = {}, context = {}) {
     if (seen.has(key)) continue
     seen.add(key)
     const thresholdRatio = round6(forceAtTokens / window)
-    if (thresholdRatio <= 0 || thresholdRatio >= 0.8) continue
+    const thresholdTokens = Math.floor(window * thresholdRatio)
+    if (thresholdRatio <= 0 || thresholdRatio >= 0.8 || thresholdTokens <= 0) continue
     const policy = { provider, model, thresholdRatio }
     const prior = previousRows.get(key)
     // Resolve the retention mode the installed row would actually inherit.
@@ -134,8 +142,8 @@ export function buildPolicies(models, options = {}, context = {}) {
       const retainTokens = prior?.retainTokens ?? serviceConfig.retainTokens
       // Max possible threshold tokens is floor(window * thresholdRatio); any
       // retained tail at/above it can never be valid, so shrink it explicitly.
-      if (Number.isInteger(retainTokens) && retainTokens >= Math.floor(window * thresholdRatio)) {
-        policy.retainTokens = Math.max(Math.floor(window * thresholdRatio / 2), 0)
+      if (Number.isInteger(retainTokens) && retainTokens >= thresholdTokens) {
+        policy.retainTokens = Math.max(Math.floor(thresholdTokens / 2), 0)
       }
     } else {
       const inherited = typeof prior?.retainRatio === 'number' && Number.isFinite(prior.retainRatio)
@@ -147,8 +155,8 @@ export function buildPolicies(models, options = {}, context = {}) {
       // rounding unless it collapses the gap at a tiny scaled threshold, and
       // emit an explicit retention whenever the inherited ratio would be
       // invalid under the new threshold.
-      if (thresholdRatio <= 0.16 || round6(inherited) >= thresholdRatio) {
-        policy.retainRatio = validRetention(thresholdRatio)
+      if (thresholdRatio <= 0.16 || round6(inherited) >= thresholdRatio || Math.floor(window * inherited) >= thresholdTokens) {
+        policy.retainRatio = validRetention(thresholdRatio, window)
       }
     }
     policies.push(policy)
@@ -225,20 +233,23 @@ export async function installPolicies(engine, llm, options = {}, commit) {
   if (policies.length === 0) return 0
   try {
     const merged = new Map(existing.map((policy) => [policyKey(policy), policy]))
+    const written = []
     for (const policy of policies) {
       const key = policyKey(policy)
       const prior = merged.get(key)
       // Preserve unrelated per-model fields (headroomTokens, maxTokens,
       // summarizationProvider/Model, retention) on a same-key replacement;
       // only the generated fields override them.
-      merged.set(key, prior === undefined ? policy : { ...prior, ...policy })
+      const row = prior === undefined ? policy : { ...prior, ...policy }
+      merged.set(key, row)
+      written.push(row)
     }
     const rows = [...merged.values()]
     const next = Object.freeze({ ...previous, modelPolicies: rows })
-    // Pass the exact row objects that land in `next` so a commit receipt's
-    // ownership identity matches what disposal will compare against.
+    // Pass the exact written row objects that land in `next` so a commit receipt
+    // owns only the rows this installation actually created or replaced.
     if (commit === undefined) engine.config = next
-    else if (!commit(previous, next, rows)) return 0
+    else if (!commit(previous, next, written)) return 0
     return policies.length
   } catch {
     return 0
@@ -274,6 +285,49 @@ const SC_FOOTER = 'these are user-issued side constraints for this session; they
 /** The plugin's generated authority line must never be counted as a constraint. */
 const SC_AUTHORITY_LINE = 'this checkpoint is the authoritative record of that span; do not restate it.'
 
+const COMPACT_OPEN_TAG = '<compacted-summary>'
+const COMPACT_CLOSE_TAG = '</compacted-summary>'
+const BULLET_RE = /^(?:[-*+•]|\d{1,3}[.)])\s+(.*)$/
+
+function splitMessageSegments(texts) {
+  const segments = []
+  let inSummary = false
+  const hasClosingAhead = (blockIdx, startOffset) => {
+    if (texts[blockIdx].toLowerCase().indexOf(COMPACT_CLOSE_TAG, startOffset) !== -1) return true
+    for (let i = blockIdx + 1; i < texts.length; i += 1) {
+      if (texts[i].toLowerCase().includes(COMPACT_CLOSE_TAG)) return true
+    }
+    return false
+  }
+  for (let blockIdx = 0; blockIdx < texts.length; blockIdx += 1) {
+    const raw = texts[blockIdx]
+    const lower = raw.toLowerCase()
+    let cursor = 0
+    while (cursor < raw.length) {
+      if (!inSummary) {
+        const openAt = lower.indexOf(COMPACT_OPEN_TAG, cursor)
+        if (openAt === -1 || !hasClosingAhead(blockIdx, openAt + COMPACT_OPEN_TAG.length)) {
+          segments.push({ text: raw.slice(cursor), inSummary: false })
+          break
+        }
+        if (openAt > cursor) segments.push({ text: raw.slice(cursor, openAt), inSummary: false })
+        inSummary = true
+        cursor = openAt + COMPACT_OPEN_TAG.length
+      } else {
+        const closeAt = lower.indexOf(COMPACT_CLOSE_TAG, cursor)
+        if (closeAt === -1) {
+          segments.push({ text: raw.slice(cursor), inSummary: true })
+          break
+        }
+        if (closeAt > cursor) segments.push({ text: raw.slice(cursor, closeAt), inSummary: true })
+        inSummary = false
+        cursor = closeAt + COMPACT_CLOSE_TAG.length
+      }
+    }
+  }
+  return segments
+}
+
 /**
  * Split one text block into extraction candidates.
  *
@@ -291,54 +345,81 @@ const SC_AUTHORITY_LINE = 'this checkpoint is the authoritative record of that s
  *
  * @returns {Array<{ text: string, prior: boolean }>}
  */
-function splitSCCandidates(text, syntheticHeadings) {
+function splitSCCandidates(text, syntheticHeadings, state = { inSummary: false, section: 'none' }) {
   const lines = String(text ?? '').replace(/\r\n?/g, '\n').split('\n')
   const candidates = []
-  let paragraph = []
-  let section = 'none' // 'none' | 'synthetic' (context/handoff) | 'prior' (Active Constraints)
-  const flushParagraph = () => {
-    if (paragraph.length === 0) return
-    const joined = paragraph.join(' ')
-    for (const sentence of joined.split(/(?<=[.!?])\s+/)) {
+  let pending = null
+  let inSyntheticBullet = false
+  let lastBullet = null
+  const flushPending = () => {
+    if (pending === null) return
+    for (const sentence of pending.split(/(?<=[.!?])\s+/)) {
       const trimmed = sentence.trim()
-      if (trimmed.length > 0) candidates.push({ text: trimmed, prior: section === 'prior' })
+      if (trimmed.length > 0) candidates.push({ text: trimmed, prior: state.section === 'prior' })
     }
-    paragraph = []
+    pending = null
   }
   for (const rawLine of lines) {
     const line = rawLine.trim()
     if (line.length === 0) {
-      flushParagraph()
+      flushPending()
+      inSyntheticBullet = false
+      lastBullet = null
       continue
     }
     const heading = line.match(/^#{1,6}\s+(.*)$/)
     if (heading !== null) {
-      flushParagraph()
+      flushPending()
+      inSyntheticBullet = false
+      lastBullet = null
       const name = heading[1].replace(/\s+/g, ' ').trim().toLowerCase()
-      if (name === SC_SECTION_HEADING.toLowerCase()) section = 'prior'
-      else if (syntheticHeadings.has(name)) section = 'synthetic'
-      else section = 'none'
+      if (name === SC_SECTION_HEADING.toLowerCase()) state.section = 'prior'
+      else if (state.inSummary || syntheticHeadings.has(name)) state.section = 'synthetic'
+      else state.section = 'none'
       continue
     }
-    if (section === 'synthetic') {
-      // Only bullets and blank continuation belong to a generated section;
-      // genuine prose appended after the note must not be swallowed.
-      if (/^(?:[-*+•]|\d{1,3}[.)])\s+/.test(line) || line.length === 0) continue
-      section = 'none'
+    if (state.section === 'synthetic') {
+      if (BULLET_RE.test(line)) {
+        inSyntheticBullet = true
+        continue
+      }
+      if (state.inSummary || (inSyntheticBullet && rawLine !== rawLine.trimStart())) continue
+      state.section = 'none'
+      inSyntheticBullet = false
     }
-    const bullet = line.match(/^(?:[-*+•]|\d{1,3}[.)])\s+(.*)$/)
+    const bullet = line.match(BULLET_RE)
     if (bullet !== null) {
-      flushParagraph()
-      candidates.push({ text: bullet[1].trim(), prior: section === 'prior' })
+      flushPending()
+      const item = { text: bullet[1].trim(), prior: state.section === 'prior' }
+      candidates.push(item)
+      lastBullet = item
       continue
     }
-    // A line that ends a sentence belongs to a flowing paragraph; an
-    // unpunctuated line is a standalone fragment (a bare constraint bullet)
-    // that must survive on its own.
-    if (/[.!?]$/.test(line)) paragraph.push(line)
-    else candidates.push({ text: line, prior: section === 'prior' })
+    if (lastBullet !== null && rawLine !== rawLine.trimStart()) {
+      lastBullet.text = `${lastBullet.text} ${line}`
+      continue
+    }
+    lastBullet = null
+    if (pending === null) {
+      pending = line
+      if (/[.!?]$/.test(pending)) flushPending()
+      continue
+    }
+    const continues = !/[.!?]$/.test(pending) && (
+      /^[a-z(\[]/.test(line)
+      || /[,:;(\-]$/.test(pending)
+      || /\b(?:and|or|to|for|of|in|on|at|by|with|without|from|the|a|an)$/i.test(pending)
+    )
+    if (continues) {
+      pending = `${pending} ${line}`
+      if (/[.!?]$/.test(pending)) flushPending()
+    } else {
+      flushPending()
+      pending = line
+      if (/[.!?]$/.test(pending)) flushPending()
+    }
   }
-  flushParagraph()
+  flushPending()
   return candidates
 }
 
@@ -391,9 +472,14 @@ export function extractSideConstraints(messages, options = {}) {
     if (msg === null || typeof msg !== 'object') continue
     if (msg.role !== 'user') continue
     const content = Array.isArray(msg.content) ? msg.content : (typeof msg.content === 'string' ? [{ type: 'text', text: msg.content }] : [])
-    for (const block of content) {
-      if (block === null || typeof block !== 'object' || typeof block.text !== 'string') continue
-      for (const { text, prior: fromPrior } of splitSCCandidates(block.text, syntheticHeadings)) {
+    const texts = content
+      .filter((block) => block !== null && typeof block === 'object' && typeof block.text === 'string')
+      .map((block) => block.text)
+    const state = { inSummary: false, section: 'none' }
+    for (const seg of splitMessageSegments(texts)) {
+      state.inSummary = seg.inSummary
+      state.section = seg.inSummary ? (state.section === 'prior' ? 'prior' : 'synthetic') : 'none'
+      for (const { text, prior: fromPrior } of splitSCCandidates(seg.text, syntheticHeadings, state)) {
         stage(text.replace(/\s+/g, ' ').trim(), fromPrior)
       }
     }
@@ -450,7 +536,7 @@ export function buildNoteText({ variant, heading = DEFAULTS.heading, summaryText
 /** Measure the session's current tokens, tolerating a missing/broken meter. */
 function measureTokens(ctx, agent) {
   try {
-    const meter = ctx?.tokenMeter
+    const meter = typeof ctx?.get === 'function' ? ctx.get('tokenMeter') : ctx?.tokenMeter
     if (meter === null || meter === undefined || typeof meter.measure !== 'function') return null
     const measurement = meter.measure(agent?.session)
     const total = measurement?.totalTokens
@@ -469,16 +555,17 @@ function mountSummary(engine, ctx, options = {}) {
   const markerDescriptor = Object.getOwnPropertyDescriptor(engine, WRAPPED)
   const token = {}
   let active = true
-  const variant = options.note
-  const heading = options.heading ?? DEFAULTS.heading
+  const resolved = normalizeOptions(options)
+  const variant = resolved.note
+  const heading = resolved.heading
   const summarize = async function (input, agent, signal) {
     const result = await original.call(this, input, agent, signal)
     if (!active || variant === 'off' || result === null || typeof result !== 'object' || !Array.isArray(result.summary)) return result
     const summaryText = result.summary
       .map((block) => (block !== null && typeof block === 'object' && typeof block.text === 'string' ? block.text : ''))
       .join('\n')
-    const sideConstraints = options.scExtract === 'pattern'
-      ? extractSideConstraints(Array.isArray(input?.messages) ? input.messages : [], { heading: options.heading })
+    const sideConstraints = resolved.scExtract === 'pattern'
+      ? extractSideConstraints(Array.isArray(input?.messages) ? input.messages : [], { heading })
       : []
     const text = buildNoteText({
       variant,
@@ -521,13 +608,60 @@ export function wrapSummarize(engine, ctx, options = {}) {
 
 const policyKey = policy => `${policy.provider}\u0000${policy.model}`
 
+const activeReceipts = new WeakMap()
+
+const getActiveReceipts = (engine) => {
+  if (engine[RECEIPTS] !== undefined) return engine[RECEIPTS]
+  let list = activeReceipts.get(engine)
+  if (list === undefined) {
+    list = []
+    try {
+      engine[RECEIPTS] = list
+    } catch {
+      activeReceipts.set(engine, list)
+    }
+  }
+  return list
+}
+
 function restorePolicies(engine, receipt) {
+  const list = engine[RECEIPTS] ?? activeReceipts.get(engine)
+  let laterReceipts = []
+  if (list !== undefined) {
+    const idx = list.indexOf(receipt)
+    if (idx !== -1) {
+      laterReceipts = list.slice(idx + 1)
+      list.splice(idx, 1)
+    }
+  }
+  const handedOff = new Set()
+  let handoffTargets = null
+  for (const [key, owned] of receipt.rows) {
+    if (!isDeepStrictEqual(owned.installed, owned.snapshot)) continue
+    for (const later of laterReceipts) {
+      const laterOwned = later.rows.get(key)
+      if (laterOwned !== undefined && laterOwned.previous === owned.installed) {
+        laterOwned.previous = owned.previous
+        handedOff.add(key)
+        if (handoffTargets === null) handoffTargets = new Set()
+        handoffTargets.add(later)
+        break
+      }
+    }
+  }
+  if (handoffTargets !== null && handoffTargets.size === 1 && handedOff.size === receipt.rows.size) {
+    const [successor] = handoffTargets
+    if (successor.previous === receipt.next) successor.previous = receipt.previous
+  }
+
   const current = engine.config
   if (!Array.isArray(current?.modelPolicies)) return
   let changed = false
   const restored = current.modelPolicies.flatMap(policy => {
-    const owned = receipt.rows.get(policyKey(policy))
-    if (!owned || policy !== owned.installed || !isDeepStrictEqual(policy, owned.snapshot)) return [policy]
+    if (!isObjectRecord(policy)) return [policy]
+    const key = policyKey(policy)
+    const owned = receipt.rows.get(key)
+    if (!owned || handedOff.has(key) || policy !== owned.installed || !isDeepStrictEqual(policy, owned.snapshot)) return [policy]
     changed = true
     return owned.previous === undefined ? [] : [owned.previous]
   })
@@ -560,7 +694,7 @@ export function apply(ctx, config = {}) {
   if (config?.note !== undefined && !NOTE_VARIANTS.has(config.note)) {
     log('warn', `compaction-force: unknown note value ${JSON.stringify(config.note)}; using "${options.note}"`)
   }
-  ctx.inject(['compaction', 'llm', 'tokenMeter'], (scope) => {
+  ctx.inject(['compaction', 'llm'], (scope) => {
     const engine = scope?.compaction
     const llm = scope?.llm
     if (engine === undefined || engine === null || typeof engine !== 'object') return
@@ -573,7 +707,8 @@ export function apply(ctx, config = {}) {
       const timers = new Set()
       const receipts = []
       const commit = (previous, next, policies) => {
-        const previousRows = new Map((previous?.modelPolicies ?? []).map(row => [policyKey(row), row]))
+        const priorList = Array.isArray(previous?.modelPolicies) ? previous.modelPolicies.filter(isObjectRecord) : []
+        const previousRows = new Map(priorList.map(row => [policyKey(row), row]))
         const receipt = {
           previous,
           next,
@@ -584,6 +719,7 @@ export function apply(ctx, config = {}) {
         if (!active) return false
         engine.config = next
         receipts.push(receipt)
+        getActiveReceipts(engine).push(receipt)
         return true
       }
       const install = async (attempt) => {

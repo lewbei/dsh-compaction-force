@@ -23,6 +23,9 @@
   "exports": {
     ".": "./index.js"
   },
+  "scripts": {
+    "test": "node verify.mjs && node verify-install.mjs"
+  },
   "files": [
     "index.js",
     "cordis.patch.yml",

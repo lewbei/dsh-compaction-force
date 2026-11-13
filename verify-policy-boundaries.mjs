@@ -21,12 +21,16 @@ console.log('PASS tiny positive threshold and zero-rounding regressions')
 
 let checked = 0
 for (const forceAtTokens of [1, 2, 3, 500, 2000, 262144]) {
-  for (const window of [500000, 500001, 1000000, 1048576, 1640000, 2000000, 3000000, 10000000]) {
+  for (const window of [500000, 500001, 600000, 700000, 900000, 1000000, 1048576, 1640000, 2000000, 3000000, 10000000]) {
     const policies = buildPolicies(catalog(window), { forceAtTokens })
     for (const policy of policies) {
       assert(policy.thresholdRatio > 0 && policy.thresholdRatio < 0.8)
+      const thresholdTokens = Math.floor(window * policy.thresholdRatio)
+      assert(thresholdTokens >= 1, `expected thresholdTokens >= 1 for ${forceAtTokens}/${window}`)
       if (policy.retainRatio !== undefined) {
         assert(policy.retainRatio > 0 && policy.retainRatio < policy.thresholdRatio)
+        assert(Math.floor(window * policy.retainRatio) < thresholdTokens,
+          `expected floor(window * retainRatio) < thresholdTokens for ${forceAtTokens}/${window}`)
       }
       if (policy.retainTokens !== undefined) {
         assert(Number.isInteger(policy.retainTokens) && policy.retainTokens >= 0)

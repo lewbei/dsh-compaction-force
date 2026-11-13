@@ -14,7 +14,7 @@
  */
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, chmodSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -90,6 +90,37 @@ try {
   assert((pkg.files ?? []).includes('scripts/prepare-patch.mjs'), 'package must ship prepare-patch')
   assert((pkg.files ?? []).includes('verify-install.mjs'), 'package must ship verify-install')
   ok('package.json includes the prepare and verification scripts')
+
+  const missingOut = spawnSync(node, [join(root, 'scripts/prepare-patch.mjs'), fixtureModule, '--out'], { encoding: 'utf8' })
+  assert.notEqual(missingOut.status, 0, '--out without argument must exit non-zero')
+  assert(!/TypeError/.test(missingOut.stderr), '--out without argument must fail cleanly without TypeError')
+  ok('prepare-patch rejects --out without a path cleanly')
+
+  const missingProfile = spawnSync(node, [join(root, 'catalog-report.mjs'), '--profile'], { encoding: 'utf8' })
+  assert.notEqual(missingProfile.status, 0, '--profile without argument must exit non-zero')
+  assert(!/profile "undefined"/.test(missingProfile.stderr), '--profile without argument must fail before invoking dsh')
+  ok('catalog-report rejects --profile without a name')
+
+  const fakeRoot = join(fixture, 'dsh-root')
+  mkdirSync(join(fakeRoot, '@deepseek-ai', 'dsh-web-app', 'presets'), { recursive: true })
+  mkdirSync(join(fakeRoot, '.bin'), { recursive: true })
+  mkdirSync(join(fakeRoot, 'node_modules', 'yaml'), { recursive: true })
+  writeFileSync(join(fakeRoot, '@deepseek-ai', 'dsh-web-app', 'presets', 'standard.patch.yml'), '- id: guarded\n')
+  writeFileSync(join(fakeRoot, 'node_modules', 'yaml', 'index.js'), 'export default { parseDocument: () => ({ toJS: () => [] }) }\n')
+  writeFileSync(join(fakeRoot, 'node_modules', 'yaml', 'package.json'), '{"name":"yaml","main":"./index.js"}\n')
+  const stubDsh = join(fakeRoot, '.bin', 'dsh')
+  writeFileSync(stubDsh, `#!/bin/sh
+echo "stub-dsh-called:$*" >&2
+exit 2
+`)
+  chmodSync(stubDsh, 0o755)
+  const reportRun = spawnSync(node, [join(root, 'catalog-report.mjs'), '--profile', 'fake'], {
+    encoding: 'utf8',
+    env: { ...process.env, PATH: '/usr/bin:/bin', DSH_INSTALL_ROOT: fakeRoot },
+  })
+  assert.notEqual(reportRun.status, 0)
+  assert(reportRun.stderr.includes('stub-dsh-called:--profile fake --dump-config'), `expected resolved .bin/dsh stderr, got: ${reportRun.stderr}`)
+  ok('catalog-report invokes resolved DSH_INSTALL_ROOT/.bin/dsh even when dsh is off PATH')
 } finally {
   rmSync(fixture, { recursive: true, force: true })
 }

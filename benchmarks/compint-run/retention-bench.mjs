@@ -118,10 +118,17 @@ function makeConversation(random, constraintCount = 6) {
 // Simulated task-centric summarizer: drops user instructions.
 // ---------------------------------------------------------------------------
 function summarize(conversation) {
-  // The summarizer keeps the task narrative but drops side constraints.
   return [
     '## Primary Request and Intent',
-    '- research the deployment pipeline and prepare a summary',
+    '- Research the deployment pipeline and prepare a rollout plan.',
+    '',
+    '## Key Technical Concepts',
+    '- Database migrations must run inside isolated transactions.',
+    '- Cache invalidation should avoid stale reads across workers.',
+    '',
+    '## Errors and Fixes',
+    '- Connection timeout: must not use default pool size of 5.',
+    '- Token validation: should reject expired refresh tokens and prevent replay.',
     '',
     '## Current Work',
     '- reading the pipeline docs',
@@ -132,12 +139,10 @@ function summarize(conversation) {
     '',
     '## Critical Context',
     '- pipeline docs are in ./docs',
+    '- Avoid deploying broken artifacts; require green verification checks.',
   ].join('\n')
 }
 
-// ---------------------------------------------------------------------------
-// Checkpoint assembly (mirrors mountSummary's append behavior)
-// ---------------------------------------------------------------------------
 function assembleCheckpoint(conversation, variant, options = {}) {
   const summaryText = summarize(conversation)
   // Mirror the real mountSummary gate: the off arm appends no note at all.
@@ -153,7 +158,14 @@ function assembleCheckpoint(conversation, variant, options = {}) {
           ? []
           : extractSideConstraints(conversation.messages, { heading: options.heading }),
       })
-  return { summary: `Framed checkpoint.\n${summaryText}`, note, full: `Framed checkpoint.\n${summaryText}${note}` }
+  const full = [
+    'This is an automatically generated checkpoint condensing an earlier span.',
+    '',
+    '<compacted-summary>',
+    `${summaryText}${note}`,
+    '</compacted-summary>',
+  ].join('\n')
+  return { summary: `Framed checkpoint.\n${summaryText}`, note, full }
 }
 
 // ---------------------------------------------------------------------------
