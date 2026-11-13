@@ -549,27 +549,37 @@ const ELLIPSIS_PUNCT_RE = /^\.{2,}$/
 const CONTINUATION_AFTER_RE = /^[a-z0-9`(\[,;:]/
 const LINE_CONTINUATION_START_RE = /^(?:[a-z(\[`"'~\/]|\.\.?\/|\d+(?:\.\d+)?(?!\d|\.\d)(?![.)](?:\s|$)))/
 const TRAILING_CONNECTOR_RE = /\b(?:and|or|nor|but|yet|so|to|for|of|in|on|at|by|with|without|from|into|onto|upon|about|against|between|through|during|before|after|until|unless|while|when|where|if|whether|that|which|who|whom|whose|than|as|via|per|under|over|above|below|within|outside|inside|near|around|across|among|beyond|the|a|an|this|these|those|my|your|our|their|his|her|its|not|never|must|should|can|cannot|could|will|would|may|might|shall|do|does|did|be|is|are|was|were|been|being|have|has|had|having|skip|edit|run|check|touch|use|keep|read|write|open|close|push|pull|merge|deploy|send|share|delete|remove|drop|modify|change|call|pass|verify|test|commit|show|ask|wait|ensure|avoid|prevent|require|follow|inspect|include|exclude|allow|block|print|log|save|store|load|fetch|update|create|build|start|stop|leave|set|get|overwrite|expose|leak|grant|revoke|bypass|ignore|disable|enable|install|uninstall|publish|release|apply|revert|reset|restart|kill|terminate)$/i
+const SENTENCE_PUNCT_CHAR_RE = /[.!?]/
+const CLOSING_PUNCT_CHAR_RE = /["'”’)\]]/
+const TOKEN_CHAR_RE = /[A-Za-z0-9_.@-]/
 
-function isNonTerminalDot(before, after, hasAfter) {
-  const token = before.match(/([A-Za-z0-9_.@-]+)$/)?.[1] ?? ''
+function trailingToken(text, endIdx) {
+  let start = endIdx
+  while (start > 0 && TOKEN_CHAR_RE.test(text[start - 1])) start -= 1
+  return text.slice(start, endIdx)
+}
+
+function isNonTerminalDot(token, afterChar, hasAfter) {
   if (token.length === 0) return false
   if (DOTTED_INITIALISM_RE.test(token)) {
-    return !hasAfter || /^(?:e\.g|i\.e)$/i.test(token) || CONTINUATION_AFTER_RE.test(after)
+    return !hasAfter || /^(?:e\.g|i\.e)$/i.test(token) || CONTINUATION_AFTER_RE.test(afterChar)
   }
   if (UNCONDITIONAL_ABBR_RE.test(token)) return true
-  if (CONTEXT_ABBR_RE.test(token)) return !hasAfter || CONTINUATION_AFTER_RE.test(after)
+  if (CONTEXT_ABBR_RE.test(token)) return !hasAfter || CONTINUATION_AFTER_RE.test(afterChar)
   return false
 }
 
 function endsWithSentencePunctuation(text) {
   const trimmed = text.trimEnd()
-  const match = trimmed.match(/([.!?]+)(["'”’)\]]*)$/)
-  if (match === null) return false
-  const [, punct, closer] = match
+  let closerStart = trimmed.length
+  while (closerStart > 0 && CLOSING_PUNCT_CHAR_RE.test(trimmed[closerStart - 1])) closerStart -= 1
+  let punctStart = closerStart
+  while (punctStart > 0 && SENTENCE_PUNCT_CHAR_RE.test(trimmed[punctStart - 1])) punctStart -= 1
+  if (punctStart === closerStart) return false
+  const punct = trimmed.slice(punctStart, closerStart)
   if (punct.length >= 2 && ELLIPSIS_PUNCT_RE.test(punct)) return false
-  if (punct === '.' && closer === '') {
-    const before = trimmed.slice(0, trimmed.length - match[0].length)
-    if (isNonTerminalDot(before, '', false)) return false
+  if (punct === '.' && closerStart === trimmed.length) {
+    if (isNonTerminalDot(trailingToken(trimmed, punctStart), '', false)) return false
   }
   return true
 }
@@ -577,20 +587,28 @@ function endsWithSentencePunctuation(text) {
 function splitSentences(text) {
   const out = []
   let start = 0
-  const re = /([.!?]+)(["'”’)\]]*)(\s+)/g
-  let match
-  while ((match = re.exec(text)) !== null) {
-    const [, punct, closer, ws] = match
-    const end = match.index + punct.length + closer.length
-    const after = text.slice(end + ws.length)
-    if (punct.length >= 2 && ELLIPSIS_PUNCT_RE.test(punct) && CONTINUATION_AFTER_RE.test(after)) continue
-    if (punct === '.' && closer === '') {
-      const before = text.slice(0, match.index)
-      if (isNonTerminalDot(before, after, true)) continue
+  let i = 0
+  while (i < text.length) {
+    if (!SENTENCE_PUNCT_CHAR_RE.test(text[i])) {
+      i += 1
+      continue
+    }
+    const punctStart = i
+    while (i < text.length && SENTENCE_PUNCT_CHAR_RE.test(text[i])) i += 1
+    const punctEnd = i
+    while (i < text.length && CLOSING_PUNCT_CHAR_RE.test(text[i])) i += 1
+    const end = i
+    while (i < text.length && /\s/.test(text[i])) i += 1
+    if (i === end) continue
+    const punct = text.slice(punctStart, punctEnd)
+    const afterChar = i < text.length ? text[i] : ''
+    if (punct.length >= 2 && ELLIPSIS_PUNCT_RE.test(punct) && CONTINUATION_AFTER_RE.test(afterChar)) continue
+    if (punct === '.' && end === punctEnd) {
+      if (isNonTerminalDot(trailingToken(text, punctStart), afterChar, true)) continue
     }
     const piece = text.slice(start, end).trim()
     if (piece.length > 0) out.push(piece)
-    start = end + ws.length
+    start = i
   }
   const rest = text.slice(start).trim()
   if (rest.length > 0) out.push(rest)
@@ -603,8 +621,7 @@ function isContinuation(pending, line) {
   if (LINE_CONTINUATION_START_RE.test(line)) return true
   const trimmed = pending.trimEnd()
   if (/[,:;(\-—–]$/.test(trimmed)) return true
-  const abbrBeforeDot = trimmed.match(/^(.*)\.$/)
-  if (abbrBeforeDot !== null && isNonTerminalDot(abbrBeforeDot[1], line, true)) return true
+  if (trimmed.endsWith('.') && isNonTerminalDot(trailingToken(trimmed, trimmed.length - 1), line.charAt(0), true)) return true
   return TRAILING_CONNECTOR_RE.test(trimmed)
 }
 

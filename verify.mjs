@@ -2153,6 +2153,27 @@ await test('buildNoteText: handles omitted options, off/unknown variants with co
   assert.match(nullHeading, /## Note to Self \(handoff\)\n- Where I was: w/)
 })
 
+await test('extractSideConstraints: sentence segmentation runs in linear time on pathological dot and punctuation runs', () => {
+  const dotsStart = performance.now()
+  const dotResult = extractSideConstraints([{ role: 'user', content: `Never deploy ${'.'.repeat(50000)}x` }])
+  const dotsMs = performance.now() - dotsStart
+  assert.equal(dotResult.length, 1)
+  assert.ok(dotResult[0].startsWith('Never deploy '))
+  assert.ok(dotsMs < 150, `expected linear dot handling, took ${dotsMs.toFixed(1)}ms`)
+
+  const bangDotStart = performance.now()
+  const bangDotResult = extractSideConstraints([{ role: 'user', content: `Always check. ${'.'.repeat(40000)}!. Next line.` }])
+  const bangDotMs = performance.now() - bangDotStart
+  assert.deepEqual(bangDotResult, ['Always check.'])
+  assert.ok(bangDotMs < 150, `expected linear non-terminal dot lookup, took ${bangDotMs.toFixed(1)}ms`)
+
+  const repeatedStart = performance.now()
+  const repeatedResult = extractSideConstraints([{ role: 'user', content: `Always ${'keep. '.repeat(5000)}Never drop.` }])
+  const repeatedMs = performance.now() - repeatedStart
+  assert.deepEqual(repeatedResult, ['Always keep.', 'Never drop.'])
+  assert.ok(repeatedMs < 200, `expected linear repeated sentence splitting, took ${repeatedMs.toFixed(1)}ms`)
+})
+
 console.log(`\n${passed} passed, ${failed} failed`)
 if (failed > 0) {
   process.exitCode = 1
