@@ -538,6 +538,99 @@ function markTraceLines(entries) {
   return dropped
 }
 
+const UNCONDITIONAL_ABBR_RE = /^(?:vs|cf|dr|mr|mrs|ms|prof|sr|jr|fig|st)$/i
+const CONTEXT_ABBR_RE = /^(?:etc|al|inc|ltd|corp|co|no|eq|sec|vol|ch|app|ref)$/i
+const DOTTED_INITIALISM_RE = /^(?:[A-Za-z]\.)+[A-Za-z]$/
+const ELLIPSIS_PUNCT_RE = /^\.{2,}$/
+const CONTINUATION_AFTER_RE = /^[a-z0-9`(\[,;:]/
+const LINE_CONTINUATION_START_RE = /^(?:[a-z(\[`"'~\/]|\.\.?\/|\d+(?:\.\d+)?(?!\d|\.\d)(?![.)](?:\s|$)))/
+const TRAILING_CONNECTOR_RE = /\b(?:and|or|nor|but|yet|so|to|for|of|in|on|at|by|with|without|from|into|onto|upon|about|against|between|through|during|before|after|until|unless|while|when|where|if|whether|that|which|who|whom|whose|than|as|via|per|under|over|above|below|within|outside|inside|near|around|across|among|beyond|the|a|an|this|these|those|my|your|our|their|his|her|its|not|never|must|should|can|cannot|could|will|would|may|might|shall|do|does|did|be|is|are|was|were|been|being|have|has|had|having|skip|edit|run|check|touch|use|keep|read|write|open|close|push|pull|merge|deploy|send|share|delete|remove|drop|modify|change|call|pass|verify|test|commit|show|ask|wait|ensure|avoid|prevent|require|follow|inspect|include|exclude|allow|block|print|log|save|store|load|fetch|update|create|build|start|stop|leave|set|get|overwrite|expose|leak|grant|revoke|bypass|ignore|disable|enable|install|uninstall|publish|release|apply|revert|reset|restart|kill|terminate)$/i
+
+function isNonTerminalDot(before, after, hasAfter) {
+  const token = before.match(/([A-Za-z0-9_.@-]+)$/)?.[1] ?? ''
+  if (token.length === 0) return false
+  if (DOTTED_INITIALISM_RE.test(token)) {
+    return !hasAfter || /^(?:e\.g|i\.e)$/i.test(token) || CONTINUATION_AFTER_RE.test(after)
+  }
+  if (UNCONDITIONAL_ABBR_RE.test(token)) return true
+  if (CONTEXT_ABBR_RE.test(token)) return !hasAfter || CONTINUATION_AFTER_RE.test(after)
+  return false
+}
+
+function endsWithSentencePunctuation(text) {
+  const trimmed = text.trimEnd()
+  const match = trimmed.match(/([.!?]+)(["'”’)\]]*)$/)
+  if (match === null) return false
+  const [, punct, closer] = match
+  if (punct.length >= 2 && ELLIPSIS_PUNCT_RE.test(punct)) return false
+  if (punct === '.' && closer === '') {
+    const before = trimmed.slice(0, trimmed.length - match[0].length)
+    if (isNonTerminalDot(before, '', false)) return false
+  }
+  return true
+}
+
+function splitSentences(text) {
+  const out = []
+  let start = 0
+  const re = /([.!?]+)(["'”’)\]]*)(\s+)/g
+  let match
+  while ((match = re.exec(text)) !== null) {
+    const [, punct, closer, ws] = match
+    const end = match.index + punct.length + closer.length
+    const after = text.slice(end + ws.length)
+    if (punct.length >= 2 && ELLIPSIS_PUNCT_RE.test(punct) && CONTINUATION_AFTER_RE.test(after)) continue
+    if (punct === '.' && closer === '') {
+      const before = text.slice(0, match.index)
+      if (isNonTerminalDot(before, after, true)) continue
+    }
+    const piece = text.slice(start, end).trim()
+    if (piece.length > 0) out.push(piece)
+    start = end + ws.length
+  }
+  const rest = text.slice(start).trim()
+  if (rest.length > 0) out.push(rest)
+  return out
+}
+
+function isContinuation(pending, line) {
+  if (endsWithSentencePunctuation(pending)) return false
+  if (/^\d+(?:\.\d+)*[.)](?:\s|$)/.test(line)) return false
+  if (LINE_CONTINUATION_START_RE.test(line)) return true
+  const trimmed = pending.trimEnd()
+  if (/[,:;(\-—–]$/.test(trimmed)) return true
+  const abbrBeforeDot = trimmed.match(/^(.*)\.$/)
+  if (abbrBeforeDot !== null && isNonTerminalDot(abbrBeforeDot[1], line, true)) return true
+  return TRAILING_CONNECTOR_RE.test(trimmed)
+}
+
+function flushPendingCandidates(candidates, state) {
+  if (state.pending === null) return
+  for (const sentence of splitSentences(state.pending)) {
+    if (sentence.length > 0) candidates.push({ text: sentence, prior: state.section === 'prior' })
+  }
+  state.pending = null
+}
+
+function emitCompletedPending(candidates, state) {
+  if (state.pending === null) return
+  const sentences = splitSentences(state.pending)
+  if (sentences.length === 0) {
+    state.pending = null
+    return
+  }
+  for (let i = 0; i < sentences.length - 1; i += 1) {
+    candidates.push({ text: sentences[i], prior: state.section === 'prior' })
+  }
+  const tail = sentences[sentences.length - 1]
+  if (endsWithSentencePunctuation(tail)) {
+    candidates.push({ text: tail, prior: state.section === 'prior' })
+    state.pending = null
+  } else {
+    state.pending = tail
+  }
+}
+
 /**
  * Split one text block into extraction candidates.
  *
@@ -555,38 +648,30 @@ function markTraceLines(entries) {
  *
  * @returns {Array<{ text: string, prior: boolean }>}
  */
-function splitSCCandidates(text, syntheticHeadings, state = { inSummary: false, section: 'none' }) {
+function splitSCCandidates(text, syntheticHeadings, state = { inSummary: false, section: 'none', pending: null }) {
+  if (!('pending' in state)) state.pending = null
   const entries = scanBlockLines(text)
   const dropped = markTraceLines(entries)
   const candidates = []
-  let pending = null
   let inSyntheticBullet = false
   let lastBullet = null
-  const flushPending = () => {
-    if (pending === null) return
-    for (const sentence of pending.split(/(?<=[.!?])\s+/)) {
-      const trimmed = sentence.trim()
-      if (trimmed.length > 0) candidates.push({ text: trimmed, prior: state.section === 'prior' })
-    }
-    pending = null
-  }
   for (let idx = 0; idx < entries.length; idx += 1) {
     const { rawLine, trimmed: line, inFence } = entries[idx]
     if (inFence || dropped[idx]) {
-      flushPending()
+      flushPendingCandidates(candidates, state)
       inSyntheticBullet = false
       lastBullet = null
       continue
     }
     if (line.length === 0) {
-      flushPending()
+      flushPendingCandidates(candidates, state)
       inSyntheticBullet = false
       lastBullet = null
       continue
     }
     const heading = line.match(/^#{1,6}\s+(.*)$/)
     if (heading !== null) {
-      flushPending()
+      flushPendingCandidates(candidates, state)
       inSyntheticBullet = false
       lastBullet = null
       const name = heading[1].replace(/\s+/g, ' ').trim().toLowerCase()
@@ -606,7 +691,7 @@ function splitSCCandidates(text, syntheticHeadings, state = { inSummary: false, 
     }
     const bullet = line.match(BULLET_RE)
     if (bullet !== null) {
-      flushPending()
+      flushPendingCandidates(candidates, state)
       const item = { text: bullet[1].trim(), prior: state.section === 'prior' }
       candidates.push(item)
       lastBullet = item
@@ -617,26 +702,20 @@ function splitSCCandidates(text, syntheticHeadings, state = { inSummary: false, 
       continue
     }
     lastBullet = null
-    if (pending === null) {
-      pending = line
-      if (/[.!?]$/.test(pending)) flushPending()
+    if (state.pending === null) {
+      state.pending = line
+      emitCompletedPending(candidates, state)
       continue
     }
-    const continues = !/[.!?]$/.test(pending) && (
-      /^[a-z(\[]/.test(line)
-      || /[,:;(\-]$/.test(pending)
-      || /\b(?:and|or|to|for|of|in|on|at|by|with|without|from|the|a|an)$/i.test(pending)
-    )
-    if (continues) {
-      pending = `${pending} ${line}`
-      if (/[.!?]$/.test(pending)) flushPending()
+    if (isContinuation(state.pending, line)) {
+      state.pending = `${state.pending} ${line}`
+      emitCompletedPending(candidates, state)
     } else {
-      flushPending()
-      pending = line
-      if (/[.!?]$/.test(pending)) flushPending()
+      flushPendingCandidates(candidates, state)
+      state.pending = line
+      emitCompletedPending(candidates, state)
     }
   }
-  flushPending()
   return candidates
 }
 
@@ -666,7 +745,7 @@ export function extractSideConstraints(messages, options = {}) {
   const prior = []
   const stage = (candidate, fromPrior) => {
     if (candidate.length < 8) return
-    if (candidate.endsWith('?')) return
+    if (/\?["'”’)\]\s]*$/.test(candidate)) return
     const lower = candidate.toLowerCase()
     if (lower === SC_FOOTER || lower.includes(SC_FOOTER)) return
     if (lower === SC_AUTHORITY_LINE || lower.includes(SC_AUTHORITY_LINE)) return
@@ -692,14 +771,26 @@ export function extractSideConstraints(messages, options = {}) {
     const texts = content
       .filter((block) => block !== null && typeof block === 'object' && typeof block.text === 'string')
       .map((block) => block.text)
-    const state = { inSummary: false, section: 'none' }
+    const state = { inSummary: false, section: 'none', pending: null }
+    const stageCandidate = ({ text, prior: fromPrior }) => {
+      stage(text.replace(/\s+/g, ' ').trim(), fromPrior)
+    }
+    const flushStatePending = () => {
+      const tail = []
+      flushPendingCandidates(tail, state)
+      for (const item of tail) stageCandidate(item)
+    }
     for (const seg of frameSummarySpans(texts)) {
-      state.inSummary = seg.inSummary
-      state.section = seg.inSummary ? (state.section === 'prior' ? 'prior' : 'synthetic') : 'none'
-      for (const { text, prior: fromPrior } of splitSCCandidates(seg.text, syntheticHeadings, state)) {
-        stage(text.replace(/\s+/g, ' ').trim(), fromPrior)
+      if (seg.inSummary !== state.inSummary) {
+        flushStatePending()
+        state.inSummary = seg.inSummary
+        state.section = seg.inSummary ? (state.section === 'prior' ? 'prior' : 'synthetic') : 'none'
+      }
+      for (const candidate of splitSCCandidates(seg.text, syntheticHeadings, state)) {
+        stageCandidate(candidate)
       }
     }
+    flushStatePending()
   }
   // New/fresh constraints win the cap; prior constraints from the previous
   // checkpoint are carried forward into the remaining slots so a lossy
