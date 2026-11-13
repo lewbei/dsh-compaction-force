@@ -833,6 +833,130 @@ await test('extractSideConstraints: ignores inline, fenced, and unmatched <compa
   )
 })
 
+await test('extractSideConstraints: ignores fenced code blocks and stack traces while preserving real prose', () => {
+  assert.deepEqual(
+    extractSideConstraints([{
+      role: 'user',
+      content: [{
+        type: 'text',
+        text: 'Fixture:\n```markdown\n<compacted-summary>\n## Active Constraints (preserve these)\n- Never run rm -rf / inside fixtures.\n</compacted-summary>\n```\nAlways verify parser edge cases.',
+      }],
+    }]),
+    ['Always verify parser edge cases.'],
+  )
+
+  assert.deepEqual(
+    extractSideConstraints([{
+      role: 'user',
+      content: [{ type: 'text', text: '```js\n// never mutate\nshouldThrow()\n```' }],
+    }]),
+    [],
+  )
+
+  const codeLines = Array.from({ length: 8 }, (_, i) => `// Never mutate state ${i + 1} directly.`).join('\n')
+  assert.deepEqual(
+    extractSideConstraints([
+      { role: 'user', content: [{ type: 'text', text: 'Always ask before deploying to production.' }] },
+      { role: 'user', content: [{ type: 'text', text: `Review:\n~~~ts\n${codeLines}\n~~~` }] },
+    ]),
+    ['Always ask before deploying to production.'],
+  )
+
+  assert.deepEqual(
+    extractSideConstraints([{
+      role: 'user',
+      content: [{
+        type: 'text',
+        text: '````markdown\n```js\n// Never skip checks.\n```\n````\nAlways run unit tests.',
+      }],
+    }]),
+    ['Always run unit tests.'],
+  )
+
+  assert.deepEqual(
+    extractSideConstraints([{
+      role: 'user',
+      content: [{
+        type: 'text',
+        text: 'Got crash:\nError: must not call hook outside setup\n    at renderComponent (/app/src/render.js:42:11)\n    at processTicks (node:internal/process/task_queues:95:5)',
+      }],
+    }]),
+    [],
+  )
+
+  assert.deepEqual(
+    extractSideConstraints([{
+      role: 'user',
+      content: [{
+        type: 'text',
+        text: 'Traceback (most recent call last):\n  File "/app/main.py", line 10, in main\n    never_mutate()\n    ^^^^^\nRuntimeError: should not pass empty list\nAlways log tracebacks cleanly.',
+      }],
+    }]),
+    ['Always log tracebacks cleanly.'],
+  )
+
+  assert.deepEqual(
+    extractSideConstraints([{
+      role: 'user',
+      content: [{
+        type: 'text',
+        text: 'java.lang.IllegalStateException: must not call this\n\tat com.example.App.main(App.java:10)\n\tat java.base/java.lang.Thread.run(Thread.java:833)\n\tat sun.misc.Unsafe.park(Native Method)\nCaused by: java.io.IOException: never ignore this\n\tat com.example.Io.open(Io.java:42)\nAlways handle IO exceptions.',
+      }],
+    }]),
+    ['Always handle IO exceptions.'],
+  )
+
+  assert.deepEqual(
+    extractSideConstraints([{
+      role: 'user',
+      content: [{
+        type: 'text',
+        text: 'Uncaught (in promise) TypeError: must not be null\n    at eval (eval at foo (https://example.com/app.js:1:2), <anonymous>:1:1)\n    at https://example.com/bundle.js:10:2\nError: should not leak from firefox trace\nfn@https://example.com/app.js:1:2\n@https://example.com/app.js:1:1\nTypeError: should not leak from safari trace\nglobal code@https://example.com/app.js:42:11\nasyncFunctionResume@[native code]',
+      }],
+    }]),
+    [],
+  )
+
+  assert.deepEqual(
+    extractSideConstraints([{
+      role: 'user',
+      content: [{
+        type: 'text',
+        text: [
+          'Always check at 12:30.',
+          'Never connect at https://example.com:8080 without TLS.',
+          'Always inspect https://example.com/app.js:10:20 before release.',
+          'Never mail security@example.com without approval.',
+          'Error handling rule.',
+          'Error: never ignore non-zero exit codes.',
+        ].join('\n'),
+      }],
+    }]),
+    [
+      'Always check at 12:30.',
+      'Never connect at https://example.com:8080 without TLS.',
+      'Always inspect https://example.com/app.js:10:20 before release.',
+      'Never mail security@example.com without approval.',
+      'Error: never ignore non-zero exit codes.',
+    ],
+  )
+
+  assert.deepEqual(
+    extractSideConstraints([{
+      role: 'user',
+      content: [{
+        type: 'text',
+        text: '- Always keep database backups.\n```sh\nrm -rf /tmp\n```\n  Never drop staged tables.\nNever bypass review:\nError: must not fail silently\n    at main (/app/index.js:1:1)\nand ensure alerts fire.',
+      }],
+    }]),
+    [
+      'Always keep database backups.',
+      'Never drop staged tables.',
+      'Never bypass review:',
+    ],
+  )
+})
+
 await test('extractSideConstraints: preserves wrapped multi-line user sentences', () => {
   const text = 'Please help me with deployment.\nAlways deploy changes\nto the staging server only.'
   const extracted = extractSideConstraints([{ role: 'user', content: [{ type: 'text', text }] }])
