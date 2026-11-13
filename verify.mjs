@@ -2329,6 +2329,126 @@ await test('wrapSummarize: non-leading surface regions price against the matched
   assert.ok(framedTokens(resC.summary) < recordsC[3].tokens + recordsC[4].tokens)
 })
 
+await test('apply: downward contextWindow updates shrink or revert policies and tighter-then-looser disposal preserves remaining mount', async () => {
+  let window = 1000000
+  const handlers = new Set()
+  const prior = { provider: 'p', model: 'm1', thresholdRatio: 0.7 }
+  const engine = makeEngine()
+  const initialConfig = Object.freeze({ ...engine.config, modelPolicies: [prior] })
+  engine.config = initialConfig
+  const llm = {
+    listProviders: () => [{ id: 'p' }],
+    listModels: async () => [{ id: 'm1' }],
+    resolveModelInfo: async () => ({ context: { contextWindow: window } }),
+  }
+  const makeScope = () => {
+    const disposers = []
+    return {
+      logger: { info() {}, warn() {} },
+      inject(_names, cb) {
+        cb({
+          compaction: engine,
+          llm,
+          on(event, fn) {
+            if (event === 'llm/adapters-updated') handlers.add(fn)
+            return () => handlers.delete(fn)
+          },
+          effect(setup) {
+            disposers.push(setup())
+          },
+        })
+      },
+      dispose() {
+        for (const fn of disposers.splice(0)) fn()
+      },
+    }
+  }
+
+  const scope = makeScope()
+  apply(scope, { forceAtTokens: 200000, minContextWindow: 500000 })
+  await tick(); await tick()
+  assert.equal(engine.config.modelPolicies[0].thresholdRatio, 0.2)
+
+  window = 800000
+  for (const fn of handlers) fn()
+  await tick(); await tick()
+  assert.equal(engine.config.modelPolicies[0].thresholdRatio, 0.25)
+
+  window = 300000
+  for (const fn of handlers) fn()
+  await tick(); await tick()
+  assert.deepEqual(engine.config.modelPolicies, [prior])
+  assert.equal(engine.config, initialConfig)
+
+  window = 1000000
+  for (const fn of handlers) fn()
+  await tick(); await tick()
+  assert.equal(engine.config.modelPolicies[0].thresholdRatio, 0.2)
+
+  const tightScope = makeScope()
+  apply(tightScope, { forceAtTokens: 100000, minContextWindow: 500000 })
+  await tick(); await tick()
+  assert.equal(engine.config.modelPolicies[0].thresholdRatio, 0.1)
+
+  tightScope.dispose()
+  assert.equal(engine.config.modelPolicies[0].thresholdRatio, 0.2)
+
+  scope.dispose()
+  assert.equal(engine.config, initialConfig)
+
+  const externalCfg = Object.freeze({ thresholdRatio: 0.8, modelPolicies: [], headroomTokens: 4096 })
+  const reMountA = makeScope()
+  apply(reMountA, { forceAtTokens: 200000, minContextWindow: 500000 })
+  await tick(); await tick()
+  engine.config = externalCfg
+  reMountA.dispose()
+  assert.equal(engine.config, externalCfg)
+
+  const reMountB = makeScope()
+  apply(reMountB, { forceAtTokens: 100000, minContextWindow: 500000 })
+  await tick(); await tick()
+  assert.equal(engine.config.modelPolicies[0].thresholdRatio, 0.1)
+  reMountB.dispose()
+  assert.equal(engine.config, externalCfg)
+
+  const dupA = { provider: 'p', model: 'm1', thresholdRatio: 0.1 }
+  const dupB = { provider: 'p', model: 'm1', thresholdRatio: 0.7 }
+  const dupCfg = Object.freeze({ ...engine.config, modelPolicies: [dupA, dupB] })
+  engine.config = dupCfg
+  const dupScope = makeScope()
+  apply(dupScope, { forceAtTokens: 200000, minContextWindow: 500000 })
+  await tick(); await tick()
+  assert.equal(engine.config, dupCfg)
+  dupScope.dispose()
+  assert.equal(engine.config, dupCfg)
+
+  const unkeyedCfg = Object.freeze({ ...engine.config, modelPolicies: [{ foo: 1 }, { bar: 2 }] })
+  engine.config = unkeyedCfg
+  window = 300000
+  const unkeyedScope = makeScope()
+  apply(unkeyedScope, { forceAtTokens: 200000, minContextWindow: 500000 })
+  await tick(); await tick()
+  for (const fn of handlers) fn()
+  await tick(); await tick()
+  assert.equal(engine.config, unkeyedCfg)
+  unkeyedScope.dispose()
+  assert.equal(engine.config, unkeyedCfg)
+
+  window = 1000000
+  engine.config = externalCfg
+  const extMaskScope = makeScope()
+  apply(extMaskScope, { forceAtTokens: 200000, minContextWindow: 500000 })
+  await tick(); await tick()
+  for (const fn of handlers) fn()
+  await tick(); await tick()
+  const ownedRow = engine.config.modelPolicies[0]
+  const extOverride = { provider: 'p', model: 'm1', thresholdRatio: 0.05 }
+  const maskedCfg = Object.freeze({ ...engine.config, modelPolicies: [extOverride, ownedRow] })
+  engine.config = maskedCfg
+  extMaskScope.dispose()
+  assert.equal(engine.config, maskedCfg)
+})
+
 console.log(`\n${passed} passed, ${failed} failed`)
 if (failed > 0) {
   process.exitCode = 1

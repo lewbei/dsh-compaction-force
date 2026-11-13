@@ -567,5 +567,99 @@ await test('mountSummary keeps real BasicCompactionEngine compactPressure and co
   }
 })
 
+await test('dynamic LlmRuntime window shrink or removal and tighter-then-looser disposal update shipped engine thresholds', async () => {
+  const { LlmRuntime } = await import(pathToFileURL(join(modules, '@deepseek-ai/dsh-llm/lib/index.js')))
+  const textStream = (text) => [{ type: 'text-chunks', time0: 0, index: 0, dt: [0], texts: [text] }]
+  const modelsMap = new Map([['m1', 1000000]])
+  const resolveModel = async (_p, model) => {
+    const cw = modelsMap.get(model)
+    return cw ? { provider: 'p1', id: model, name: model, context: { contextWindow: cw }, defaultMaxTokens: 1000 } : undefined
+  }
+  const adapter = {
+    providerInfo: (id) => ({ id, name: id }),
+    providerRetryPolicy: () => undefined,
+    listModels: async () => [...modelsMap.keys()].map((id) => ({ provider: 'p1', id, name: id })),
+    resolveModel,
+    prepareCall: async (p, model) => ({ model: await resolveModel(p, model), async *stream() {} }),
+    imageRequestPricing: () => undefined,
+    fileRequestText: (ref) => `[file:${ref?.id ?? 'x'}]`,
+  }
+
+  const ctx = new Context()
+  await ctx.plugin(SessionProjectionRegistry)
+  await ctx.plugin(SessionStore)
+  await ctx.plugin(TokenMeter)
+  await ctx.plugin(LlmRuntime)
+  await flush()
+  const regHandle = ctx.get('llm').registerAdapter(['p1'], adapter)
+  await ctx.plugin(BasicCompactionEngine, { auto: false })
+  const engine = ctx.get('compaction')
+  const originalConfig = engine.config
+  try {
+    const fTight = await ctx.plugin(plugin, { note: 'off', forceAtTokens: 100000, minContextWindow: 500000 })
+    const fLoose = await ctx.plugin(plugin, { note: 'off', forceAtTokens: 200000, minContextWindow: 500000 })
+    await flush()
+    assert.equal(engine.config.modelPolicies[0].thresholdRatio, 0.1)
+
+    await fTight.dispose()
+    await flush()
+    assert.equal(engine.config.modelPolicies[0].thresholdRatio, 0.2)
+
+    modelsMap.set('m1', 800000)
+    regHandle.replace(['p1'])
+    await flush()
+    await flush()
+    assert.equal(engine.config.modelPolicies[0].thresholdRatio, 0.25)
+
+    const sessions = ctx.get('sessions')
+    const header = { config: { provider: 'p1', model: 'm1', maxTokens: 1000 } }
+    const s800 = sessions.create(undefined, { meta: { cwd: '/tmp' } })
+    s800.append('system/message', { message: { role: 'system', content: [{ type: 'text', text: 'Sys.' }] } }, { surfaceOp: 'append' })
+    s800.append('request/header', { header })
+    s800.append('turn/start', { turn: 1 })
+    s800.append('user/message', { role: 'user', content: [{ type: 'text', text: 'a'.repeat(160000) }] }, { surfaceOp: 'append' })
+    s800.append('step/start', { turn: 1, step: 1 })
+    s800.append('assistant/message', { turn: 1, step: 1, message: { role: 'assistant', source: { kind: 'model', provider: 'p1', model: 'm1' }, content: [{ type: 'text', text: 'ok' }] }, stream: textStream('ok') }, { surfaceOp: 'append' })
+    s800.append('step/end', { turn: 1, step: 1 })
+    s800.append('turn/end', { turn: 1 })
+    s800.append('turn/start', { turn: 2 })
+    s800.append('user/message', { role: 'user', content: [{ type: 'text', text: 'b'.repeat(540000) }] }, { surfaceOp: 'append' })
+    s800.append('step/start', { turn: 2, step: 1 })
+    s800.append('assistant/message', { turn: 2, step: 1, message: { role: 'assistant', source: { kind: 'model', provider: 'p1', model: 'm1' }, content: [{ type: 'text', text: 'ok2' }] }, stream: textStream('ok2') }, { surfaceOp: 'append' })
+    s800.append('step/end', { turn: 2, step: 1 })
+    s800.append('user/message', { role: 'user', content: [{ type: 'text', text: 'latest' }] }, { surfaceOp: 'append' })
+    assert.equal(await engine.compactPressure({ session: s800, options: header.config }, header, signal, false), null)
+
+    modelsMap.set('m1', 300000)
+    regHandle.replace(['p1'])
+    await flush()
+    await flush()
+    assert.deepEqual(engine.config.modelPolicies, [])
+    assert.equal(engine.config, originalConfig)
+
+    const s300 = sessions.create(undefined, { meta: { cwd: '/tmp' } })
+    s300.append('system/message', { message: { role: 'system', content: [{ type: 'text', text: 'Sys.' }] } }, { surfaceOp: 'append' })
+    s300.append('request/header', { header })
+    s300.append('turn/start', { turn: 1 })
+    s300.append('user/message', { role: 'user', content: [{ type: 'text', text: 'a'.repeat(100000) }] }, { surfaceOp: 'append' })
+    s300.append('step/start', { turn: 1, step: 1 })
+    s300.append('assistant/message', { turn: 1, step: 1, message: { role: 'assistant', source: { kind: 'model', provider: 'p1', model: 'm1' }, content: [{ type: 'text', text: 'ok' }] }, stream: textStream('ok') }, { surfaceOp: 'append' })
+    s300.append('step/end', { turn: 1, step: 1 })
+    s300.append('turn/end', { turn: 1 })
+    s300.append('turn/start', { turn: 2 })
+    s300.append('user/message', { role: 'user', content: [{ type: 'text', text: 'b'.repeat(200000) }] }, { surfaceOp: 'append' })
+    s300.append('step/start', { turn: 2, step: 1 })
+    s300.append('assistant/message', { turn: 2, step: 1, message: { role: 'assistant', source: { kind: 'model', provider: 'p1', model: 'm1' }, content: [{ type: 'text', text: 'ok2' }] }, stream: textStream('ok2') }, { surfaceOp: 'append' })
+    s300.append('step/end', { turn: 2, step: 1 })
+    s300.append('user/message', { role: 'user', content: [{ type: 'text', text: 'latest' }] }, { surfaceOp: 'append' })
+    assert.equal(await engine.compactPressure({ session: s300, options: header.config }, header, signal, false), null)
+
+    await fLoose.dispose()
+    assert.equal(engine.config, originalConfig)
+  } finally {
+    await ctx.fiber.dispose()
+  }
+})
+
 console.log(`${passed} passed, ${failed} failed (real Cordis lifecycle and shipped engine; controlled catalog and summarizer)`)
 if (failed) process.exitCode = 1
