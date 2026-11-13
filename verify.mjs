@@ -1207,6 +1207,50 @@ await test('extractSideConstraints: scopes synthetic and prior sections across b
   )
 })
 
+await test('extractSideConstraints: deduplicates over-long truncated constraints, matches negative contractions, preserves balanced backticks, and orders checkpoints chronologically', () => {
+  const longConstraint = 'Never deploy any service modification to the production cluster without first obtaining written sign-off from at least two senior engineers and running the complete end-to-end integration test suite across both staging regions and verifying metrics.'
+  const firstLong = extractSideConstraints([{ role: 'user', content: [{ type: 'text', text: longConstraint }] }])
+  assert.equal(firstLong.length, 1)
+  assert.ok(firstLong[0].length <= 240)
+  const cpLong = {
+    role: 'user',
+    content: [
+      { type: 'text', text: '<compacted-summary>' },
+      { type: 'text', text: buildNoteText({ variant: 'handoff', summaryText: '## Current Work\n- work', sideConstraints: firstLong }) },
+      { type: 'text', text: '</compacted-summary>' },
+    ],
+  }
+  assert.deepEqual(extractSideConstraints([cpLong, { role: 'user', content: [{ type: 'text', text: longConstraint }] }]), firstLong)
+
+  const longCode = `Never run \`${'a/'.repeat(120)}script.sh\` without checking permissions first.`
+  const truncCode = extractSideConstraints([{ role: 'user', content: [{ type: 'text', text: longCode }] }])
+  assert.equal(truncCode.length, 1)
+  assert.ok(truncCode[0].length <= 240)
+  assert.equal((truncCode[0].match(/`/g) || []).length % 2, 0)
+
+  const contractions = extractSideConstraints([{
+    role: 'user',
+    content: [{
+      type: 'text',
+      text: "You cannot push directly to main.\nYou can't modify files outside src/.\nWe mustn't drop database tables.\nYou shouldn't skip the linter.\nYou can’t bypass checks.\nThis change won't compile cleanly yet.",
+    }],
+  }])
+  assert.deepEqual(contractions, [
+    'You cannot push directly to main.',
+    "You can't modify files outside src/.",
+    "We mustn't drop database tables.",
+    "You shouldn't skip the linter.",
+    'You can’t bypass checks.',
+  ])
+
+  const cp1 = { role: 'user', content: [{ type: 'text', text: `<compacted-summary>\n${buildNoteText({ variant: 'handoff', sideConstraints: ['Never A1.'] })}\n</compacted-summary>` }] }
+  const midOlderUser = { role: 'user', content: [{ type: 'text', text: Array.from({ length: 8 }, (_, i) => `Always old ${i + 1}.`).join('\n') }] }
+  const cp2Newer = { role: 'user', content: [{ type: 'text', text: `<compacted-summary>\n${buildNoteText({ variant: 'handoff', sideConstraints: ['Never newer C1.'] })}\n</compacted-summary>` }] }
+  const ordered = extractSideConstraints([cp1, midOlderUser, cp2Newer])
+  assert.equal(ordered[0], 'Never newer C1.')
+  assert.equal(ordered.length, 8)
+})
+
 await test('wrapSummarize: uses normalized defaults when options are omitted or partial', async () => {
   const input = { messages: [{ role: 'user', content: [{ type: 'text', text: 'Never deploy without approval.' }] }] }
   const defaultsEngine = makeEngine()
