@@ -1401,6 +1401,209 @@ await test('buildNoteText and wrapSummarize: exact small token formatting, text-
   assert.match(resPrimary.summary[1].text, /~3K tokens on /)
 })
 
+await test('wrapSummarize: fits or drops optional note framing within shadowed token budget', async () => {
+  const estimateMessage = (msg) => {
+    const content = Array.isArray(msg?.content) ? msg.content : [{ type: 'text', text: String(msg?.content ?? '') }]
+    const chars = content.reduce((sum, block) => sum + String(block?.text ?? '').length, 0)
+    return Math.ceil(chars / 4) + 4
+  }
+  const summaryText = [
+    '## Current Work',
+    '- Refactoring module A cleanly across several helpers and updating interfaces.',
+    '## Next Step',
+    '- Run end to end verification across all packages and confirm outputs.',
+    '## Critical Context',
+    '- Maintain backward compatibility with older session logs.',
+  ].join('\n')
+
+  const makeMeter = () => ({ measure: () => ({ totalTokens: 500 }), estimateMessage })
+  const framedTokens = (blocks) => estimateMessage({
+    role: 'user',
+    content: [
+      { type: 'text', text: 'This is an automatically generated checkpoint condensing an earlier span of the conversation to free up context. Treat the captured context as established background and build on it without restating it. Continue the task directly from the messages that follow, without acknowledging this checkpoint.\n\n<compacted-summary>' },
+      ...blocks,
+      { type: 'text', text: '</compacted-summary>' },
+    ],
+  })
+
+  const bareTokens = framedTokens([{ type: 'text', text: summaryText }])
+  const makeInputWithBudget = (budgetTokens, userText) => ({
+    messages: [
+      { role: 'system', content: [{ type: 'text', text: 'System.' }] },
+      { role: 'user', content: [{ type: 'text', text: userText + '\n' + 'a'.repeat(Math.max(0, (budgetTokens - 5) * 4 - userText.length)) }] },
+    ],
+  })
+
+  const engineCompactBoth = makeEngine(summaryText)
+  wrapSummarize(engineCompactBoth, fakeCtx({ tokenMeter: makeMeter() }), { note: 'both', scExtract: 'pattern' })
+  const fullOnlyTokens = framedTokens([
+    { type: 'text', text: summaryText },
+    { type: 'text', text: buildNoteText({ summaryText, variant: 'both', totalTokens: 500, timestamp: '2026-01-01T00:00:00.000Z', sideConstraints: ['Never deploy without approval.'], compact: false }) },
+  ])
+  const compactBothInput = makeInputWithBudget(fullOnlyTokens, 'Never deploy without approval.')
+  const compactBothRes = await engineCompactBoth.summarize(compactBothInput, { session: {} }, undefined)
+  assert.equal(compactBothRes.summary.length, 2)
+  assert.match(compactBothRes.summary[1].text, /Where I was:/)
+  assert.doesNotMatch(compactBothRes.summary[1].text, /MUST survive every compaction/)
+  assert.ok(framedTokens(compactBothRes.summary) < fullOnlyTokens)
+
+  const engineHandoff = makeEngine(summaryText)
+  wrapSummarize(engineHandoff, fakeCtx({ tokenMeter: makeMeter() }), { note: 'both', scExtract: 'pattern' })
+  const compactBothTokens = framedTokens([
+    { type: 'text', text: summaryText },
+    { type: 'text', text: buildNoteText({ summaryText, variant: 'both', totalTokens: 500, timestamp: '2026-01-01T00:00:00.000Z', sideConstraints: ['Never deploy without approval.'], compact: true }) },
+  ])
+  const handoffRes = await engineHandoff.summarize(makeInputWithBudget(compactBothTokens, 'Never deploy without approval.'), { session: {} }, undefined)
+  assert.equal(handoffRes.summary.length, 2)
+  assert.match(handoffRes.summary[1].text, /Where I was:/)
+  assert.doesNotMatch(handoffRes.summary[1].text, /Note to Self \(context\)/)
+  assert.ok(framedTokens(handoffRes.summary) < compactBothTokens)
+
+  const longHandoffSummary = [
+    '## Current Work',
+    '- Refactoring module A cleanly across several helpers and updating every exported interface carefully.',
+    '## Next Step',
+    '- Run end to end verification across all downstream packages and confirm all outputs match specs.',
+    '## Critical Context',
+    '- Maintain strict backward compatibility with older session logs and custom adapter hooks everywhere.',
+  ].join('\n')
+  const engineContextArm = makeEngine(longHandoffSummary)
+  wrapSummarize(engineContextArm, fakeCtx({ tokenMeter: makeMeter() }), { note: 'both', scExtract: 'pattern' })
+  const handoffTooBigTokens = framedTokens([
+    { type: 'text', text: longHandoffSummary },
+    { type: 'text', text: buildNoteText({ summaryText: longHandoffSummary, variant: 'handoff', totalTokens: 500, timestamp: '2026-01-01T00:00:00.000Z', sideConstraints: ['Never deploy without approval.'], compact: true }) },
+  ])
+  const contextArmRes = await engineContextArm.summarize(makeInputWithBudget(handoffTooBigTokens, 'Never deploy without approval.'), { session: {} }, undefined)
+  assert.equal(contextArmRes.summary.length, 2)
+  assert.match(contextArmRes.summary[1].text, /Note to Self \(context\)/)
+  assert.match(contextArmRes.summary[1].text, /Never deploy without approval\./)
+  assert.doesNotMatch(contextArmRes.summary[1].text, /Where I was:/)
+  assert.ok(framedTokens(contextArmRes.summary) < handoffTooBigTokens)
+
+  const engineSliceSc = makeEngine(summaryText)
+  wrapSummarize(engineSliceSc, fakeCtx({ tokenMeter: makeMeter() }), { note: 'both', scExtract: 'pattern' })
+  const twoScText = 'Never deploy without approval.\nAlways run regression suite.'
+  const twoScTokens = framedTokens([
+    { type: 'text', text: summaryText },
+    { type: 'text', text: buildNoteText({ summaryText, variant: 'off', totalTokens: 500, timestamp: '2026-01-01T00:00:00.000Z', sideConstraints: ['Never deploy without approval.', 'Always run regression suite.'], compact: true }) },
+  ])
+  const sliceScRes = await engineSliceSc.summarize(makeInputWithBudget(twoScTokens, twoScText), { session: {} }, undefined)
+  assert.equal(sliceScRes.summary.length, 2)
+  assert.match(sliceScRes.summary[1].text, /Never deploy without approval\./)
+  assert.doesNotMatch(sliceScRes.summary[1].text, /Always run regression suite\./)
+  assert.doesNotMatch(sliceScRes.summary[1].text, /Where I was:/)
+  assert.ok(framedTokens(sliceScRes.summary) < twoScTokens)
+
+  const engineNoSc = makeEngine('## Current Work\n- A.\n## Next Step\n- B.')
+  wrapSummarize(engineNoSc, fakeCtx({ tokenMeter: makeMeter() }), { note: 'handoff', scExtract: 'pattern' })
+  const longSc = 'Never ' + 'deploy '.repeat(12) + 'without approval.'
+  const noScLimit = framedTokens([
+    { type: 'text', text: '## Current Work\n- A.\n## Next Step\n- B.' },
+    { type: 'text', text: buildNoteText({ summaryText: '## Current Work\n- A.\n## Next Step\n- B.', variant: 'handoff', totalTokens: 500, timestamp: '2026-01-01T00:00:00.000Z', sideConstraints: [], compact: true }) },
+  ]) + 2
+  const noScRes = await engineNoSc.summarize(makeInputWithBudget(noScLimit, longSc), { session: {} }, undefined)
+  assert.equal(noScRes.summary.length, 2)
+  assert.match(noScRes.summary[1].text, /Where I was:/)
+  assert.doesNotMatch(noScRes.summary[1].text, /Active Constraints/)
+  assert.ok(framedTokens(noScRes.summary) < noScLimit)
+
+  const engineContextNoSc = makeEngine(summaryText)
+  wrapSummarize(engineContextNoSc, fakeCtx({ tokenMeter: makeMeter() }), { note: 'context', scExtract: 'pattern' })
+  const longScCtx = 'Never ' + 'deploy '.repeat(35) + 'without approval.'
+  const noScCtxLimit = framedTokens([
+    { type: 'text', text: summaryText },
+    { type: 'text', text: buildNoteText({ summaryText, variant: 'context', totalTokens: 500, timestamp: '2026-01-01T00:00:00.000Z', sideConstraints: [], compact: true }) },
+  ]) + 2
+  const noScCtxRes = await engineContextNoSc.summarize(makeInputWithBudget(noScCtxLimit, longScCtx), { session: {} }, undefined)
+  assert.equal(noScCtxRes.summary.length, 2)
+  assert.match(noScCtxRes.summary[1].text, /Note to Self \(context\)/)
+  assert.doesNotMatch(noScCtxRes.summary[1].text, /Active Constraints/)
+  assert.ok(framedTokens(noScCtxRes.summary) < noScCtxLimit)
+
+  const engineTiny = makeEngine(summaryText)
+  wrapSummarize(engineTiny, fakeCtx({ tokenMeter: makeMeter() }), { note: 'both', scExtract: 'pattern' })
+  const tinyRes = await engineTiny.summarize(makeInputWithBudget(bareTokens, 'Never deploy.'), { session: {} }, undefined)
+  assert.equal(tinyRes.summary.length, 1)
+
+  const engineThrowingMeter = makeEngine(summaryText)
+  wrapSummarize(engineThrowingMeter, fakeCtx({ tokenMeter: {
+    measure: () => ({ totalTokens: 500 }),
+    estimateMessage: () => { throw new Error('meter boom') },
+  } }), { note: 'both', scExtract: 'pattern' })
+  const throwingRes = await engineThrowingMeter.summarize(makeInputWithBudget(10, 'Never deploy.'), { session: {} }, undefined)
+  assert.equal(throwingRes.summary.length, 2)
+  assert.match(throwingRes.summary[1].text, /MUST survive every compaction/)
+
+  const makeSurfaceSession = (nodesData) => ({
+    surface: { nodes: nodesData.map((n) => n.seq) },
+    eventAt: (seq) => nodesData.find((n) => n.seq === seq),
+    deriveEventMessage: (ev) => ev?.msg ?? null,
+  })
+  const surfaceSession = makeSurfaceSession([
+    { seq: 1, type: 'system/message', msg: { role: 'system', content: [{ type: 'text', text: 'Sys1.' }] } },
+    { seq: 2, type: 'user/message', msg: { role: 'user', content: [{ type: 'text', text: 'Never deploy without approval.' }] } },
+    { seq: 3, type: 'meta/marker', msg: null },
+    { seq: 4, type: 'system/message', msg: { role: 'system', content: [{ type: 'text', text: 'Sys2.' }] } },
+  ])
+  const surfaceInput = {
+    messages: [
+      surfaceSession.eventAt(1).msg,
+      surfaceSession.eventAt(2).msg,
+      surfaceSession.eventAt(4).msg,
+    ],
+  }
+
+  const engineSurfaceBudget = makeEngine(summaryText)
+  wrapSummarize(engineSurfaceBudget, fakeCtx({ tokenMeter: {
+    measure: (sess) => sess === surfaceSession
+      ? { totalTokens: 500, nodes: [{ seq: 1, tokens: 10 }, { seq: 2, tokens: 60 }, { seq: 3, tokens: 40 }, { seq: 4, tokens: 190 }] }
+      : { totalTokens: 500 },
+    estimateMessage,
+  } }), { note: 'both', scExtract: 'pattern' })
+  const surfaceRes = await engineSurfaceBudget.summarize(surfaceInput, { session: surfaceSession }, undefined)
+  assert.equal(surfaceRes.summary.length, 2)
+  assert.ok(framedTokens(surfaceRes.summary) < 290)
+  assert.match(surfaceRes.summary[1].text, /Where I was:/)
+
+  const mismatchResEngine = makeEngine(summaryText)
+  wrapSummarize(mismatchResEngine, fakeCtx({ tokenMeter: {
+    measure: () => ({ totalTokens: 500, nodes: [{ seq: 1, tokens: 10 }] }),
+    estimateMessage,
+  } }), { note: 'both', scExtract: 'pattern' })
+  const mismatchRes = await mismatchResEngine.summarize(surfaceInput, { session: surfaceSession }, undefined)
+  assert.equal(mismatchRes.summary.length, 1)
+
+  const badNodeTokensEngine = makeEngine(summaryText)
+  wrapSummarize(badNodeTokensEngine, fakeCtx({ tokenMeter: {
+    measure: () => ({ totalTokens: 500, nodes: [{ seq: 1, tokens: 10 }, { seq: 2, tokens: Number.NaN }, { seq: 3, tokens: 40 }, { seq: 4, tokens: 90 }] }),
+    estimateMessage,
+  } }), { note: 'both', scExtract: 'pattern' })
+  const badNodeTokensRes = await badNodeTokensEngine.summarize(surfaceInput, { session: surfaceSession }, undefined)
+  assert.equal(badNodeTokensRes.summary.length, 1)
+
+  const seqMismatchEngine = makeEngine(summaryText)
+  wrapSummarize(seqMismatchEngine, fakeCtx({ tokenMeter: {
+    measure: () => ({ totalTokens: 500, nodes: [{ seq: 1, tokens: 10 }, { seq: 99, tokens: 1000 }, { seq: 3, tokens: 40 }, { seq: 4, tokens: 90 }] }),
+    estimateMessage,
+  } }), { note: 'both', scExtract: 'pattern' })
+  const seqMismatchRes = await seqMismatchEngine.summarize(surfaceInput, { session: surfaceSession }, undefined)
+  assert.equal(seqMismatchRes.summary.length, 1)
+
+  const zeroSurfaceEngine = makeEngine(summaryText)
+  wrapSummarize(zeroSurfaceEngine, fakeCtx({ tokenMeter: {
+    measure: () => ({ totalTokens: 500, nodes: [{ seq: 1, tokens: 0 }, { seq: 2, tokens: 0 }, { seq: 3, tokens: 0 }, { seq: 4, tokens: 0 }] }),
+    estimateMessage,
+  } }), { note: 'both', scExtract: 'pattern' })
+  const zeroSurfaceRes = await zeroSurfaceEngine.summarize(surfaceInput, { session: surfaceSession }, undefined)
+  assert.equal(zeroSurfaceRes.summary.length, 2)
+  assert.match(zeroSurfaceRes.summary[1].text, /MUST survive every compaction/)
+
+  const noMeasureEngine = makeEngine(summaryText)
+  wrapSummarize(noMeasureEngine, fakeCtx({ tokenMeter: { estimateMessage } }), { note: 'both', scExtract: 'pattern' })
+  const noMeasureRes = await noMeasureEngine.summarize(surfaceInput, { session: surfaceSession }, undefined)
+  assert.equal(noMeasureRes.summary.length, 1)
+})
+
 console.log(`\n${passed} passed, ${failed} failed`)
 if (failed > 0) {
   process.exitCode = 1
