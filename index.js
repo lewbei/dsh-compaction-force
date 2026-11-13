@@ -46,10 +46,24 @@ export const DEFAULTS = Object.freeze({
 const NOTE_VARIANTS = new Set(['off', 'context', 'handoff', 'both'])
 const WRAPPED = Symbol.for('@local/dsh-compaction-force/wrapped')
 const RECEIPTS = Symbol.for('@local/dsh-compaction-force/receipts')
+const CORDIS_ORIGINAL = Symbol.for('cordis.original')
 const CATALOG_TTL_MS = 5 * 60 * 1000
 
 /** Cached provider/model catalog per llm service, with an in-flight promise. */
 const catalogCache = new WeakMap()
+
+const unwrapService = (value) => {
+  let current = value
+  const seen = new Set()
+  while (current !== null && (typeof current === 'object' || typeof current === 'function') && !seen.has(current)) {
+    seen.add(current)
+    let next
+    try { next = current[CORDIS_ORIGINAL] } catch { break }
+    if (next === null || (typeof next !== 'object' && typeof next !== 'function') || next === current) break
+    current = next
+  }
+  return current
+}
 
 /** Accept a positive integer, or a numeric string (e.g. YAML `"1000"`). */
 const toPositiveInt = (value, fallback) => {
@@ -213,38 +227,35 @@ export async function collectCatalog(llm) {
 
 /** Cached catalog: one enumeration per llm service per TTL, shared by engines. */
 export function catalogFor(llm) {
-  // A missing/non-object llm service must degrade to an empty catalog instead
-  // of throwing inside the WeakMap (unhandled rejection) during install.
   if (llm === null || typeof llm !== 'object') return Promise.resolve([])
-  const hit = catalogCache.get(llm)
+  const cacheKey = unwrapService(llm)
+  const hit = catalogCache.get(cacheKey)
   const now = Date.now()
   if (hit !== undefined && hit.models !== undefined && now - hit.at < CATALOG_TTL_MS) return Promise.resolve(hit.models)
   if (hit !== undefined && hit.promise !== undefined) return hit.promise
   const promise = collectCatalog(llm)
     .catch(() => [])
     .then((models) => {
-      catalogCache.set(llm, { at: Date.now(), models })
+      if (catalogCache.get(cacheKey)?.promise === promise) {
+        if (models.length > 0) catalogCache.set(cacheKey, { at: Date.now(), models })
+        else catalogCache.delete(cacheKey)
+      }
       return models
     })
-  catalogCache.set(llm, { at: 0, promise })
+  catalogCache.set(cacheKey, { at: 0, promise })
   return promise
 }
 
-/**
- * Install the per-model early-compaction policies on one compaction engine.
- * The engine object itself is not frozen; `engine.config` is a frozen value
- * but the property is writable, so a new frozen config replaces it atomically.
- */
-export async function installPolicies(engine, llm, options = {}, commit) {
-  if (engine === null || typeof engine !== 'object') return 0
-  const models = await catalogFor(llm)
-  const previous = engine.config
-  // Drop malformed rows (e.g. null entries) instead of aborting installation; a
-  // healthy reinstall replaces the config wholesale and self-heals.
-  const existing = Array.isArray(previous?.modelPolicies) ? previous.modelPolicies.filter((row) => row !== null && typeof row === 'object') : []
-  const policies = buildPolicies(models, options, { previousRows: existing, serviceConfig: previous })
-  if (policies.length === 0) return 0
+async function runInstallPolicies(engine, llm, options = {}, commit) {
+  if (engine === null || typeof engine !== 'object') return { installed: 0, catalogCount: 0 }
+  let catalogCount = 0
   try {
+    const models = await catalogFor(llm)
+    catalogCount = models.length
+    const previous = engine.config
+    const existing = Array.isArray(previous?.modelPolicies) ? previous.modelPolicies.filter((row) => row !== null && typeof row === 'object') : []
+    const policies = buildPolicies(models, options, { previousRows: existing, serviceConfig: previous })
+    if (policies.length === 0) return { installed: 0, catalogCount }
     const merged = new Map(existing.map((policy) => [policyKey(policy), policy]))
     const written = []
     for (const policy of policies) {
@@ -259,14 +270,21 @@ export async function installPolicies(engine, llm, options = {}, commit) {
     }
     const rows = [...merged.values()]
     const next = Object.freeze({ ...previous, modelPolicies: rows })
-    // Pass the exact written row objects that land in `next` so a commit receipt
-    // owns only the rows this installation actually created or replaced.
     if (commit === undefined) engine.config = next
-    else if (!commit(previous, next, written)) return 0
-    return policies.length
+    else if (!commit(previous, next, written)) return { installed: 0, catalogCount }
+    return { installed: policies.length, catalogCount }
   } catch {
-    return 0
+    return { installed: 0, catalogCount }
   }
+}
+
+/**
+ * Install the per-model early-compaction policies on one compaction engine.
+ * The engine object itself is not frozen; `engine.config` is a frozen value
+ * but the property is writable, so a new frozen config replaces it atomically.
+ */
+export async function installPolicies(engine, llm, options = {}, commit) {
+  return (await runInstallPolicies(engine, llm, options, commit)).installed
 }
 
 /** Extract up to maxBullets bullet items under one `## Heading` section. */
@@ -717,8 +735,12 @@ export function apply(ctx, config = {}) {
       // function) must still install its policies.
       const disposeSummary = mountSummary(engine, scope, options) ?? (() => {})
       let active = true
+      let inFlight = false
+      let rerunRequested = false
+      let installEpoch = 0
       const timers = new Set()
       const receipts = []
+      const llmKey = llm !== null && typeof llm === 'object' ? unwrapService(llm) : null
       const commit = (previous, next, policies) => {
         const priorList = Array.isArray(previous?.modelPolicies) ? previous.modelPolicies.filter(isObjectRecord) : []
         const previousRows = new Map(priorList.map(row => [policyKey(row), row]))
@@ -735,32 +757,68 @@ export function apply(ctx, config = {}) {
         getActiveReceipts(engine).push(receipt)
         return true
       }
-      const install = async (attempt) => {
+      const installLoop = async (initialAttempt) => {
         if (!active) return
+        if (inFlight) {
+          rerunRequested = true
+          return
+        }
+        inFlight = true
+        let attempt = initialAttempt
         try {
-          const installed = await installPolicies(engine, llm, options, commit)
-          if (!active) return
-          if (installed > 0) {
-            log('info', `compaction-force: installed ${installed} model policies (forceAtTokens=${options.forceAtTokens}, minContextWindow=${options.minContextWindow})`)
+          while (active) {
+            rerunRequested = false
+            const runEpoch = installEpoch
+            const { installed, catalogCount } = await runInstallPolicies(engine, llm, options, (previous, next, policies) => {
+              if (!active || runEpoch !== installEpoch) return false
+              return commit(previous, next, policies)
+            })
+            if (!active) return
+            if (rerunRequested || runEpoch !== installEpoch) {
+              attempt = 0
+              continue
+            }
+            if (installed > 0) {
+              log('info', `compaction-force: installed ${installed} model policies (forceAtTokens=${options.forceAtTokens}, minContextWindow=${options.minContextWindow})`)
+              return
+            }
+            if (catalogCount > 0) {
+              if (receipts.length === 0) {
+                log('info', `compaction-force: no new model policies installed (no catalog model qualifies above minContextWindow=${options.minContextWindow} or tighter policy already active)`)
+              }
+              return
+            }
+            if (attempt < 2) {
+              const timer = globalThis.setTimeout(() => {
+                timers.delete(timer)
+                void installLoop(attempt + 1)
+              }, attempt === 0 ? 500 : 2000)
+              timers.add(timer)
+              return
+            }
+            log('warn', `compaction-force: no model policies installed (empty catalog or no window > ${options.minContextWindow}); compaction keeps the shipped threshold`)
             return
           }
-          if (attempt < 2) {
-            catalogCache.delete(llm)
-            const timer = globalThis.setTimeout(() => {
-              timers.delete(timer)
-              void install(attempt + 1)
-            }, attempt === 0 ? 500 : 2000)
-            timers.add(timer)
-            return
-          }
-          log('warn', `compaction-force: no model policies installed (empty catalog or no window > ${options.minContextWindow}); compaction keeps the shipped threshold`)
         } catch (error) {
           if (active) log('warn', `compaction-force: policy installation failed: ${error instanceof Error ? error.message : String(error)}`)
+        } finally {
+          inFlight = false
         }
       }
-      void install(0)
+      const unsubscribe = typeof scope.on === 'function'
+        ? scope.on('llm/adapters-updated', () => {
+            if (!active) return
+            installEpoch += 1
+            if (llmKey !== null) catalogCache.delete(llmKey)
+            for (const timer of timers) globalThis.clearTimeout(timer)
+            timers.clear()
+            void installLoop(0)
+          })
+        : null
+      void installLoop(0)
       return () => {
         active = false
+        try { if (typeof unsubscribe === 'function') unsubscribe() } catch {}
         for (const timer of timers) globalThis.clearTimeout(timer)
         timers.clear()
         try {
