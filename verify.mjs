@@ -2449,6 +2449,89 @@ await test('apply: downward contextWindow updates shrink or revert policies and 
   assert.equal(engine.config, maskedCfg)
 })
 
+await test('apply: invalidates catalogCache on unmount so unmounted adapters-updated is never stale while preserving overlapping share', async () => {
+  const handlers = new Set()
+  const emitter = {}
+  let catalogList = [{ id: 'm1', window: 1000000 }]
+  let listCalls = 0
+  const engine = makeEngine()
+  const originalConfig = engine.config
+  const llm = {
+    listProviders: () => [{ id: 'p' }],
+    listModels: async () => {
+      listCalls += 1
+      return catalogList.map((m) => ({ id: m.id }))
+    },
+    resolveModelInfo: async (_p, m) => ({ context: { contextWindow: catalogList.find((x) => x.id === m).window } }),
+  }
+  const makeScope = () => {
+    const disposers = []
+    return {
+      events: emitter,
+      logger: { info() {}, warn() {} },
+      inject(_names, cb) {
+        cb({
+          compaction: engine,
+          llm,
+          events: emitter,
+          on(event, fn) {
+            if (event === 'llm/adapters-updated') handlers.add(fn)
+            return () => handlers.delete(fn)
+          },
+          effect(setup) {
+            disposers.push(setup())
+          },
+        })
+      },
+      dispose() {
+        for (const fn of disposers.splice(0)) fn()
+      },
+    }
+  }
+
+  const s1 = makeScope()
+  apply(s1, { forceAtTokens: 200000, minContextWindow: 500000 })
+  await tick(); await tick()
+  assert.equal(listCalls, 1)
+  assert.deepEqual(engine.config.modelPolicies.map((p) => p.model), ['m1'])
+  assert.equal(handlers.size, 1)
+  s1.dispose()
+  assert.equal(handlers.size, 0)
+  assert.equal(engine.config, originalConfig)
+
+  catalogList = [{ id: 'm1', window: 1000000 }, { id: 'm2', window: 2000000 }]
+  for (const fn of handlers) fn()
+
+  const s2 = makeScope()
+  apply(s2, { forceAtTokens: 200000, minContextWindow: 500000 })
+  await tick(); await tick()
+  assert.equal(listCalls, 2)
+  assert.deepEqual(engine.config.modelPolicies.map((p) => [p.model, p.thresholdRatio]), [['m1', 0.2], ['m2', 0.1]])
+
+  const sOverlap = makeScope()
+  apply(sOverlap, { forceAtTokens: 100000, minContextWindow: 500000 })
+  await tick(); await tick()
+  assert.equal(listCalls, 2)
+  s2.dispose()
+  assert.equal(handlers.size, 1)
+
+  const sOverlap2 = makeScope()
+  apply(sOverlap2, { forceAtTokens: 100000, minContextWindow: 500000 })
+  await tick(); await tick()
+  assert.equal(listCalls, 2)
+
+  sOverlap.dispose()
+  sOverlap2.dispose()
+  assert.equal(handlers.size, 0)
+  assert.equal(engine.config, originalConfig)
+
+  const s3 = makeScope()
+  apply(s3, { forceAtTokens: 200000, minContextWindow: 500000 })
+  await tick(); await tick()
+  assert.equal(listCalls, 3)
+  s3.dispose()
+})
+
 console.log(`\n${passed} passed, ${failed} failed`)
 if (failed > 0) {
   process.exitCode = 1
