@@ -1291,24 +1291,25 @@ function mountSummary(engine, ctx, options = {}) {
   }
   const original = target.summarize
   const descriptor = Object.getOwnPropertyDescriptor(target, 'summarize')
+  const canDefineOwn = descriptor ? descriptor.configurable : Object.isExtensible(target)
   const layers = [layer]
   const wrapper = async function (input, agent, signal) {
+    const activeLayer = layers.at(-1)
     const result = await original.call(this, input, agent, signal)
     if (signal?.aborted === true) return result
-    const top = layers.at(-1)
-    if (!top || top.options.note === 'off' || !isObjectRecord(result) || !Array.isArray(result.summary)) return result
+    if (!activeLayer || !layers.includes(activeLayer) || activeLayer.options.note === 'off' || !isObjectRecord(result) || !Array.isArray(result.summary)) return result
     const summaryText = result.summary
       .filter((block) => block !== null && typeof block === 'object' && block.type === 'text' && typeof block.text === 'string')
       .map((block) => block.text)
       .join('\n')
-    const sideConstraints = top.options.scExtract === 'pattern'
-      ? extractSideConstraints(Array.isArray(input?.messages) ? input.messages : [], { heading: top.options.heading })
+    const sideConstraints = activeLayer.options.scExtract === 'pattern'
+      ? extractSideConstraints(Array.isArray(input?.messages) ? input.messages : [], { heading: activeLayer.options.heading })
       : []
-    const meter = resolveMeter(top.ctx, target)
+    const meter = resolveMeter(activeLayer.ctx, target)
     const budget = computeShadowedBudget(input, agent, meter)
     const text = fitNoteToBudget({
-      variant: top.options.note,
-      heading: top.options.heading,
+      variant: activeLayer.options.note,
+      heading: activeLayer.options.heading,
       summaryText,
       totalTokens: measureTokensFromMeter(meter, agent),
       timestamp: new Date().toISOString(),
@@ -1319,17 +1320,33 @@ function mountSummary(engine, ctx, options = {}) {
   }
   const restore = () => {
     if (wrapperRegistry.get(target) === entry) wrapperRegistry.delete(target)
-    if (Object.getOwnPropertyDescriptor(target, 'summarize')?.value !== wrapper) return
-    if (descriptor) {
-      if (descriptor.configurable) Object.defineProperty(target, 'summarize', descriptor)
-      else target.summarize = descriptor.value
-    } else {
-      delete target.summarize
+    if (canDefineOwn || (descriptor && 'value' in descriptor)) {
+      if (Object.getOwnPropertyDescriptor(target, 'summarize')?.value !== wrapper) return
+      if (descriptor) {
+        if (descriptor.configurable) Object.defineProperty(target, 'summarize', descriptor)
+        else target.summarize = descriptor.value
+      } else {
+        delete target.summarize
+      }
+      return
     }
+    try {
+      if (target.summarize !== wrapper) return
+      target.summarize = original
+    } catch {}
   }
   const entry = { layers, restore }
   try {
-    target.summarize = wrapper
+    if (canDefineOwn) {
+      Object.defineProperty(target, 'summarize', {
+        value: wrapper,
+        writable: true,
+        configurable: true,
+        enumerable: descriptor ? descriptor.enumerable : true,
+      })
+    } else {
+      target.summarize = wrapper
+    }
     wrapperRegistry.set(target, entry)
     return makeDispose(entry)
   } catch {

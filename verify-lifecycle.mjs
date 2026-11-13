@@ -790,5 +790,48 @@ await test('in-flight collectCatalog unmounted before resolution never repopulat
   }
 })
 
+await test('mid-flight summarize honors layer active at invocation across concurrent disposal or new mount', async () => {
+  const { ctx, engine } = fixture()
+  let release
+  let started
+  const gate = () => new Promise((resolve) => { started = resolve })
+  const callDone = () => new Promise((resolve) => { release = resolve })
+  let nextGate = callDone()
+  engine.summarize = async () => {
+    started()
+    return await nextGate
+  }
+  try {
+    const f1 = await ctx.plugin(plugin, { note: 'context', forceAtTokens: 200000 })
+    const f2 = await ctx.plugin(plugin, { note: 'off', forceAtTokens: 100000 })
+    await flush()
+
+    let ready = gate()
+    const pendingOff = engine.summarize(input, {}, signal)
+    await ready
+    await f2.dispose()
+    release({ summary: [{ type: 'text', text: 'Under off.' }] })
+    assert.equal((await pendingOff).summary.length, 1)
+
+    nextGate = callDone()
+    ready = gate()
+    const pendingCtx = engine.summarize(input, {}, signal)
+    await ready
+    const f3 = await ctx.plugin(plugin, { note: 'handoff', heading: 'Late Layer', forceAtTokens: 100000 })
+    await flush()
+    release({ summary: [{ type: 'text', text: 'Under context.' }] })
+    const ctxRes = await pendingCtx
+    assert.equal(ctxRes.summary.length, 2)
+    assert.match(ctxRes.summary[1].text, /Note to Self \(context\)/)
+    assert.doesNotMatch(ctxRes.summary[1].text, /## Late Layer/)
+
+    await f3.dispose()
+    await f1.dispose()
+  } finally {
+    if (release) release({ summary: [{ type: 'text', text: 'cleanup' }] })
+    await ctx.fiber.dispose()
+  }
+})
+
 console.log(`${passed} passed, ${failed} failed (real Cordis lifecycle and shipped engine; controlled catalog and summarizer)`)
 if (failed) process.exitCode = 1
