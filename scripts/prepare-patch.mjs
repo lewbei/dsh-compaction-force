@@ -58,7 +58,12 @@ if (!patch.includes(`name: ${quotedPath}`) || !patch.includes('id: compaction-fo
 
 const outIndex = args.indexOf('--out')
 if (outIndex !== -1) {
-  const out = resolve(args[outIndex + 1])
+  const outArg = args[outIndex + 1]
+  if (typeof outArg !== 'string' || outArg.length === 0 || outArg.startsWith('--')) {
+    console.error('prepare-patch: --out requires an output file path')
+    process.exit(1)
+  }
+  const out = resolve(outArg)
   writeFileSync(out, patch)
   console.log(`prepared patch written to ${out}`)
 } else {
