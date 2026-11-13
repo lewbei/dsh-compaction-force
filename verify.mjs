@@ -1604,6 +1604,52 @@ await test('wrapSummarize: fits or drops optional note framing within shadowed t
   assert.equal(noMeasureRes.summary.length, 1)
 })
 
+await test('sectionBullets: handles fences, subheadings, numbered/+ bullets, continuations, placeholders, whitespace, and bounds', () => {
+  assert.deepEqual(sectionBullets('## Current Work\n1. implementing parser\n2. writing tests', 'Current Work'), ['implementing parser', 'writing tests'])
+  assert.deepEqual(sectionBullets('## Next Step\n* check lint\n+ run suite\n• check output', 'Next Step', 3), ['check lint', 'run suite', 'check output'])
+  assert.deepEqual(sectionBullets('## Current Work\n- implementing the parser for\n  nested constraint blocks\nand continuation line.\n- writing tests', 'Current Work'), [
+    'implementing the parser for nested constraint blocks and continuation line.',
+    'writing tests',
+  ])
+  assert.deepEqual(sectionBullets('## Current Work\n- working on\n  ***important*** parser\n---\n___\n* * *\n> quoted note', 'Current Work', 3), ['working on ***important*** parser'])
+  assert.deepEqual(sectionBullets('## Critical Context\n### Security\n- never edit /etc\n- always require auth\n## Next Step\n- ignored', 'Critical Context', 3), [
+    'never edit /etc',
+    'always require auth',
+  ])
+  assert.deepEqual(sectionBullets([
+    '## Files and Code',
+    '```markdown',
+    '## Current Work',
+    '- fake bullet from fence',
+    '```',
+    '## Current Work',
+    '- updating script:',
+    '  ```bash',
+    '  # bash comment',
+    '  -flag',
+    '  ```',
+    '  ~~~sh',
+    '  ## Current Work',
+    '  - tilde fake',
+    '  ~~~',
+    '- running tests',
+  ].join('\n'), 'Current Work', 3), ['updating script:', 'running tests'])
+  assert.deepEqual(sectionBullets('## Next Step\n- (none)\n- None\n- (None).', 'Next Step'), [])
+  assert.deepEqual(sectionBullets('## Next Step\n- (none)\n- run verifier', 'Next Step', 1), ['run verifier'])
+  assert.deepEqual(sectionBullets('## Current Work\n- item 1', 'Current Work', 0), [])
+  assert.deepEqual(sectionBullets('## Current Work\n- item 1', 'Current Work', -1), [])
+  assert.deepEqual(sectionBullets('## Current Work\n- item 1', 'Current Work', 2, 0), [])
+  assert.deepEqual(sectionBullets('## Current Work\n- item 1', 'Current Work', 2, -5), [])
+  assert.deepEqual(sectionBullets('##  Current   Work \n- item 1', '  Current   Work  '), ['item 1'])
+  const codeTrunc = sectionBullets(`## Current Work\n- Avoid \`${'a/'.repeat(60)}file.js\``, 'Current Work', 2, 40)
+  assert.equal(codeTrunc.length, 1)
+  assert.ok(codeTrunc[0].length <= 40)
+  assert.equal((codeTrunc[0].match(/`/g) || []).length % 2, 0)
+  assert.deepEqual(sectionBullets('## Current Work\n- Use ``a`b`` extra words', 'Current Work', 2, 11), ['Use ``a``…'])
+  assert.deepEqual(sectionBullets('## Current Work\n- Use `a``b` extra words', 'Current Work', 2, 10), ['Use `a`…'])
+  assert.deepEqual(sectionBullets('## Current Work\n- Avoid ``a```b`` extra words', 'Current Work', 2, 14), ['Avoid ``a``…'])
+})
+
 console.log(`\n${passed} passed, ${failed} failed`)
 if (failed > 0) {
   process.exitCode = 1
