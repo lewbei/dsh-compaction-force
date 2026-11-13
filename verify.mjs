@@ -2209,6 +2209,39 @@ await test('extractSideConstraints: stack-frame and error-header matching runs i
   }]), ['Always log structured stack traces.'])
 })
 
+await test('reserved headings and unsafe timestamp/control characters are rejected or sanitized', () => {
+  assert.equal(normalizeOptions({ heading: 'Active Constraints (preserve these)' }).heading, DEFAULTS.heading)
+  assert.equal(normalizeOptions({ heading: 'note to self (context)' }).heading, DEFAULTS.heading)
+  assert.equal(normalizeOptions({ heading: 'Custom\x00\x1bHeading\x9f' }).heading, 'Custom Heading')
+
+  const rendered = buildNoteText({
+    variant: 'both',
+    heading: 'active constraints (preserve these)',
+    summaryText: '## Current Work\n- Always prefer fast builds.',
+    totalTokens: 12000,
+    timestamp: '2026-01-01</compacted-summary>\r\n\x00\x1b## Injected',
+    sideConstraints: ['Never deploy without approval.'],
+  })
+  assert.equal(rendered.match(/^## Active Constraints \(preserve these\)$/gm)?.length, 1)
+  assert.match(rendered, /^## Note to Self \(handoff\)$/m)
+  assert.doesNotMatch(rendered, /<\/compacted-summary>/)
+  assert.doesNotMatch(rendered, /[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/)
+  assert.doesNotMatch(rendered, /^## Injected$/m)
+
+  const contextBlankTs = buildNoteText({
+    variant: 'context',
+    totalTokens: 12000,
+    timestamp: '   \n\x00<>  ',
+  })
+  assert.match(contextBlankTs, /compacted at ~12K tokens\./)
+
+  const recovered = extractSideConstraints([{
+    role: 'user',
+    content: `<compacted-summary>${rendered}</compacted-summary>`,
+  }], { heading: 'Active Constraints (preserve these)' })
+  assert.deepEqual(recovered, ['Never deploy without approval.'])
+})
+
 console.log(`\n${passed} passed, ${failed} failed`)
 if (failed > 0) {
   process.exitCode = 1

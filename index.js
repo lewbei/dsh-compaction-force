@@ -71,16 +71,29 @@ const toPositiveInt = (value, fallback) => {
 }
 
 const normalizeHeading = (value) => (
-  typeof value === 'string' ? value.replace(/[\r\n<>]+/g, ' ').replace(/\s+/g, ' ').trim() : ''
+  typeof value === 'string'
+    ? value.replace(/[\u0000-\u001f\u007f-\u009f<>]+/g, ' ').replace(/\s+/g, ' ').trim()
+    : ''
 )
+
+const SC_SECTION_HEADING = 'Active Constraints (preserve these)'
+const SC_CONTEXT_NOTE_HEADING = 'Note to Self (context)'
+const RESERVED_HEADINGS = new Set([
+  SC_SECTION_HEADING.toLowerCase(),
+  SC_CONTEXT_NOTE_HEADING.toLowerCase(),
+])
+
+const resolveHandoffHeading = (value) => {
+  const cleaned = normalizeHeading(value)
+  return cleaned.length > 0 && !RESERVED_HEADINGS.has(cleaned.toLowerCase()) ? cleaned : DEFAULTS.heading
+}
 
 /** Normalize one row config into a complete, validated option set. */
 export function normalizeOptions(config = {}) {
   const forceAtTokens = toPositiveInt(config?.forceAtTokens, DEFAULTS.forceAtTokens)
   const minContextWindow = toPositiveInt(config?.minContextWindow, DEFAULTS.minContextWindow)
   const note = NOTE_VARIANTS.has(config?.note) ? config.note : DEFAULTS.note
-  const sanitizedHeading = normalizeHeading(config?.heading)
-  const heading = sanitizedHeading.length > 0 ? sanitizedHeading : DEFAULTS.heading
+  const heading = resolveHandoffHeading(config?.heading)
   const scExtract = ['off', 'pattern'].includes(config?.scExtract) ? config.scExtract : DEFAULTS.scExtract
   return { forceAtTokens, minContextWindow, note, heading, scExtract }
 }
@@ -420,10 +433,6 @@ export function sectionBullets(summaryText, heading, maxBullets = 2, maxChars = 
     .map((item) => truncateBalanced(item, maxChars))
 }
 
-/** Heading of the plugin's own Active Constraints section (generated, not user). */
-const SC_SECTION_HEADING = 'Active Constraints (preserve these)'
-/** Heading of the plugin's own context note section (generated, not user). */
-const SC_CONTEXT_NOTE_HEADING = 'Note to Self (context)'
 /** The plugin's generated footer must never be counted as a user constraint. */
 const SC_FOOTER = 'these are user-issued side constraints for this session; they must survive every compaction.'
 /** The plugin's generated authority line must never be counted as a constraint. */
@@ -939,8 +948,7 @@ function splitSCCandidates(
  */
 export function extractSideConstraints(messages, options = {}) {
   const constraintRe = /\b(don['’]?t|do not|never|always|cannot|can['’]?t|must(?:\s+not)?|mustn['’]?t|should(?:\s+not)?|shouldn['’]?t|before (?:you|any)|wait for (?:my|your)|confirm (?:with|before)|ask (?:me|before)|show me (?:the|what)|until i (?:say|tell|confirm)|unless i|only (?:when|if|after)|no (?:emails?|messages?|files?|changes?|deletions?|emails|sending)|avoid|prevent|ensure (?:that|you)|require(?:d)? (?:that|to)|from now on|for the rest of (?:this )?session)\b/i
-  const sanitizedHeading = normalizeHeading(options?.heading)
-  const customHeading = (sanitizedHeading.length > 0 ? sanitizedHeading : DEFAULTS.heading).toLowerCase()
+  const customHeading = resolveHandoffHeading(options?.heading).toLowerCase()
   const seen = new Set()
   const out = []
   const stage = (candidate) => {
@@ -1047,14 +1055,14 @@ export function buildNoteText(options = {}) {
     compact = false,
   } = safeOptions
   if (!ACTIVE_NOTE_VARIANTS.has(variant)) return ''
-  const normalizedHeading = normalizeHeading(heading)
-  const resolvedHeading = normalizedHeading.length > 0 ? normalizedHeading : DEFAULTS.heading
+  const resolvedHeading = resolveHandoffHeading(heading)
   const parts = []
   if (variant === 'context' || variant === 'both') {
     const size = Number.isInteger(totalTokens) && totalTokens > 0
       ? (totalTokens >= 1000 ? `~${Math.round(totalTokens / 1000)}K tokens` : `~${totalTokens} tokens`)
       : 'the context limit'
-    const when = typeof timestamp === 'string' && timestamp.length > 0 ? ` on ${timestamp}` : ''
+    const cleanTimestamp = normalizeHeading(timestamp)
+    const when = cleanTimestamp.length > 0 ? ` on ${cleanTimestamp}` : ''
     parts.push(compact
       ? [
           '## Note to Self (context)',
