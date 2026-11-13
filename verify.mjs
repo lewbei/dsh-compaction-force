@@ -106,19 +106,32 @@ const makeLlm = (catalog) => {
   }
 }
 
-const fakeCtx = (services) => ({
-  tokenMeter: services.tokenMeter,
-  logs: [],
-  logger: {
-    info(message) { this.owner.logs.push(['info', message]) },
-    warn(message) { this.owner.logs.push(['warn', message]) },
-    owner: null,
-  },
-  inject(names, callback) {
-    this.names = names
-    callback({ ...services, effect: (setup) => setup() })
-  },
-})
+const fakeCtx = (services) => {
+  const disposables = []
+  return {
+    tokenMeter: services.tokenMeter,
+    logs: [],
+    logger: {
+      info(message) { this.owner.logs.push(['info', message]) },
+      warn(message) { this.owner.logs.push(['warn', message]) },
+      owner: null,
+    },
+    dispose() {
+      while (disposables.length > 0) disposables.pop()()
+    },
+    inject(names, callback) {
+      this.names = names
+      callback({
+        ...services,
+        effect: (setup) => {
+          const cleanup = setup()
+          if (typeof cleanup === 'function') disposables.push(cleanup)
+          return cleanup
+        },
+      })
+    },
+  }
+}
 
 await test('normalizeOptions: defaults, overrides, invalid values', () => {
   assert.deepEqual(normalizeOptions(), { ...DEFAULTS })
@@ -685,6 +698,7 @@ await test('apply: with no llm service installs nothing and does not crash', asy
   apply(ctx, { forceAtTokens: 262144, minContextWindow: 500000 })
   await tick()
   await tick()
+  ctx.dispose()
   assert.equal(engine.config.modelPolicies.length, 0, 'no llm means no policies')
   assert.deepEqual(await catalogFor(undefined), [])
   assert.deepEqual(await catalogFor(null), [])
@@ -914,6 +928,7 @@ await test('buildPolicies and apply: preserve tighter thresholds and tolerate nu
   const ctx = fakeCtx({ compaction: engine, llm: makeLlm([]) })
   ctx.logger.owner = ctx
   assert.doesNotThrow(() => apply(ctx, { note: 1n }))
+  ctx.dispose()
   assert.ok(ctx.logs.some(([level, message]) => level === 'warn' && message.includes('unknown note value 1')))
 })
 
@@ -1008,9 +1023,21 @@ await test('catalogFor and apply: unwrap Cordis proxy keys, avoid poisoning empt
   assert.deepEqual(await catalogFor(lateLlm), [{ provider: 'late', model: 'big', contextWindow: 1000000 }])
 
   let dynamicCatalog = [{ provider: 'a', model: 'm1', window: 1000000 }]
+  let firstStarted
+  let releaseFirst
+  let callIndex = 0
+  const firstReady = new Promise((resolve) => { firstStarted = resolve })
+  const firstGate = new Promise((resolve) => { releaseFirst = resolve })
   const dynamicLlm = {
     listProviders: () => [{ id: 'a', name: 'a' }],
-    listModels: async () => dynamicCatalog.map((m) => ({ provider: m.provider, id: m.model, name: m.model })),
+    async listModels() {
+      callIndex += 1
+      if (callIndex === 1) {
+        firstStarted()
+        await firstGate
+      }
+      return dynamicCatalog.map((m) => ({ provider: m.provider, id: m.model, name: m.model }))
+    },
     resolveModelInfo: async (provider, model) => {
       const hit = dynamicCatalog.find((m) => m.provider === provider && m.model === model)
       return { provider, id: model, context: { contextWindow: hit.window } }
@@ -1018,6 +1045,7 @@ await test('catalogFor and apply: unwrap Cordis proxy keys, avoid poisoning empt
   }
   const engine = makeEngine()
   const listeners = new Set()
+  let disposeEffect = null
   const eventCtx = {
     logs: [],
     logger: { info() {}, warn() {} },
@@ -1029,21 +1057,77 @@ await test('catalogFor and apply: unwrap Cordis proxy keys, avoid poisoning empt
           if (event === 'llm/adapters-updated') listeners.add(fn)
           return () => listeners.delete(fn)
         },
-        effect: (fn) => fn(),
+        effect(fn) {
+          disposeEffect = fn()
+          return disposeEffect
+        },
       })
     },
   }
-  const dispose = apply(eventCtx, { forceAtTokens: 200000, minContextWindow: 500000 })
-  await tick()
-  assert.deepEqual(engine.config.modelPolicies.map((p) => p.model), ['m1'])
+  apply(eventCtx, { forceAtTokens: 200000, minContextWindow: 500000 })
+  await firstReady
   dynamicCatalog = [
     { provider: 'a', model: 'm1', window: 1000000 },
     { provider: 'a', model: 'm2', window: 1000000 },
   ]
   for (const fn of listeners) fn()
+  releaseFirst()
+  await tick()
   await tick()
   assert.deepEqual(engine.config.modelPolicies.map((p) => p.model), ['m1', 'm2'])
-  if (typeof dispose === 'function') dispose()
+  assert.equal(listeners.size, 1)
+  disposeEffect()
+  assert.equal(listeners.size, 0)
+  assert.deepEqual(engine.config.modelPolicies, [])
+
+  let retryCatalogReady = false
+  const timers = []
+  const savedSetTimeout = globalThis.setTimeout
+  const savedClearTimeout = globalThis.clearTimeout
+  const retryEngine = makeEngine()
+  let disposeRetry = null
+  globalThis.setTimeout = (fn, delay, ...args) => {
+    if (delay !== 500 && delay !== 2000) return savedSetTimeout(fn, delay, ...args)
+    const id = { fn }
+    timers.push(id)
+    return id
+  }
+  globalThis.clearTimeout = (id) => {
+    const idx = timers.indexOf(id)
+    if (idx !== -1) timers.splice(idx, 1)
+    else savedClearTimeout(id)
+  }
+  try {
+    const retryLlm = {
+      listProviders: () => [{ id: 'r', name: 'r' }],
+      listModels: async () => (retryCatalogReady ? [{ provider: 'r', id: 'big', name: 'big' }] : []),
+      resolveModelInfo: async () => ({ provider: 'r', id: 'big', context: { contextWindow: 1000000 } }),
+    }
+    apply({
+      logs: [],
+      logger: { info() {}, warn() {} },
+      inject(names, cb) {
+        cb({
+          compaction: retryEngine,
+          llm: retryLlm,
+          effect(fn) {
+            disposeRetry = fn()
+            return disposeRetry
+          },
+        })
+      },
+    }, { forceAtTokens: 200000, minContextWindow: 500000 })
+    await tick()
+    assert.equal(timers.length, 1)
+    retryCatalogReady = true
+    timers.shift().fn()
+    await tick()
+    assert.deepEqual(retryEngine.config.modelPolicies.map((p) => p.model), ['big'])
+  } finally {
+    disposeRetry?.()
+    globalThis.setTimeout = savedSetTimeout
+    globalThis.clearTimeout = savedClearTimeout
+  }
 })
 
 console.log(`\n${passed} passed, ${failed} failed`)
