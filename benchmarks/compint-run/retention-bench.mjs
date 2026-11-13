@@ -37,28 +37,115 @@ import { buildNoteText, extractSideConstraints } from '../../index.js'
 // ---------------------------------------------------------------------------
 // CLI parsing (kept dependency-free)
 // ---------------------------------------------------------------------------
+const VALID_ARMS = ['off', 'context', 'handoff', 'both']
+const VALUE_FLAGS = new Set(['--instances', '--seeds', '--constraints', '--generations', '--arms'])
+
+function failCli(message) {
+  console.error(`retention-bench: ${message}`)
+  process.exit(1)
+}
+
+function printUsage() {
+  console.log(`Usage: node benchmarks/compint-run/retention-bench.mjs [options]
+
+Options:
+  --instances N    scenarios per seed per arm (default 10, --full: 100)
+  --seeds a,b,c    comma-separated deterministic seeds (default 20261112)
+  --constraints K  constraints per scenario, 1..${CONSTRAINT_POOL.length} (default 6, --full: 8)
+  --generations G  repeated-compaction generations >= 1 (default 2, --full: 3)
+  --arms a,b,c     arms from off,context,handoff,both (default all four)
+  --full           shorthand for --instances 100 --seeds 101,202,303
+                   --constraints 8 --generations 3
+  -h, --help       show this help text`)
+}
+
+function parsePositiveInt(flag, raw, max = Infinity) {
+  const trimmed = raw.trim()
+  if (!/^\d+$/.test(trimmed)) failCli(`${flag} must be a positive integer (got "${raw}")`)
+  const value = Number(trimmed)
+  if (!Number.isSafeInteger(value) || value <= 0) failCli(`${flag} must be a positive integer (got "${raw}")`)
+  if (value > max) failCli(`${flag} cannot exceed ${max} (got ${value})`)
+  return value
+}
+
+function parseSeeds(raw) {
+  const out = []
+  const seen = new Set()
+  for (const part of raw.split(',')) {
+    const trimmed = part.trim()
+    if (!/^\d+$/.test(trimmed)) failCli(`--seeds must contain non-negative 32-bit integers (got "${raw}")`)
+    const seed = Number(trimmed)
+    if (!Number.isSafeInteger(seed) || seed > 0xffffffff) failCli(`seed out of 32-bit range: "${trimmed}"`)
+    if (seen.has(seed)) failCli(`duplicate seed in --seeds: ${seed}`)
+    seen.add(seed)
+    out.push(seed)
+  }
+  return out
+}
+
+function parseArms(raw) {
+  const out = []
+  const seen = new Set()
+  for (const part of raw.split(',')) {
+    const trimmed = part.trim()
+    if (trimmed.length === 0) failCli(`--arms contains an empty entry (expected: ${VALID_ARMS.join(', ')})`)
+    if (!VALID_ARMS.includes(trimmed)) failCli(`unknown arm "${trimmed}" (expected: ${VALID_ARMS.join(', ')})`)
+    if (seen.has(trimmed)) failCli(`duplicate arm in --arms: ${trimmed}`)
+    seen.add(trimmed)
+    out.push(trimmed)
+  }
+  return out
+}
+
 function parseArgs(argv) {
-  const get = (name, fallback) => {
-    const index = argv.indexOf(name)
-    return index === -1 ? fallback : argv[index + 1]
+  const seen = new Set()
+  const overrides = {}
+  let isFull = false
+  let endOfFlags = false
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i]
+    if (!endOfFlags && arg === '--') {
+      endOfFlags = true
+      continue
+    }
+    if (!endOfFlags) {
+      const eq = arg.indexOf('=')
+      const flag = eq === -1 ? arg : arg.slice(0, eq)
+      if (flag === '--help' || flag === '-h') {
+        if (eq !== -1) failCli(`${flag} does not take a value`)
+        printUsage()
+        process.exit(0)
+      }
+      if (flag === '--full') {
+        if (eq !== -1) failCli('--full does not take a value')
+        if (seen.has('--full')) failCli('--full specified more than once')
+        seen.add('--full')
+        isFull = true
+        continue
+      }
+      if (VALUE_FLAGS.has(flag)) {
+        if (seen.has(flag)) failCli(`${flag} specified more than once`)
+        seen.add(flag)
+        const raw = eq === -1 ? argv[++i] : arg.slice(eq + 1)
+        if (typeof raw !== 'string' || (eq === -1 && raw.startsWith('-'))) {
+          failCli(`${flag} requires a value`)
+        }
+        if (raw.trim().length === 0) failCli(`${flag} must not be empty`)
+        if (flag === '--instances') overrides.instances = parsePositiveInt(flag, raw)
+        else if (flag === '--constraints') overrides.constraints = parsePositiveInt(flag, raw, CONSTRAINT_POOL.length)
+        else if (flag === '--generations') overrides.generations = parsePositiveInt(flag, raw)
+        else if (flag === '--seeds') overrides.seeds = parseSeeds(raw)
+        else if (flag === '--arms') overrides.arms = parseArms(raw)
+        continue
+      }
+      if (arg.startsWith('-')) failCli(`unknown option: ${arg}`)
+    }
+    failCli(`unexpected argument: ${arg}`)
   }
-  let instances = Number(get('--instances', 10))
-  let seeds = get('--seeds', '20261112').split(',').map((value) => Number(value.trim())).filter(Number.isFinite)
-  let constraints = Number(get('--constraints', 6))
-  let generations = Number(get('--generations', 2))
-  let arms = get('--arms', 'off,context,handoff,both').split(',').map((value) => value.trim()).filter(Boolean)
-  if (argv.includes('--full')) {
-    instances = 100
-    seeds = [101, 202, 303]
-    constraints = 8
-    generations = 3
-    arms = ['off', 'context', 'handoff', 'both']
-  }
-  if (!Number.isInteger(instances) || instances <= 0) instances = 10
-  if (!Number.isInteger(constraints) || constraints <= 0) constraints = 6
-  if (!Number.isInteger(generations) || generations <= 0) generations = 2
-  if (seeds.length === 0) seeds = [20261112]
-  return { instances, seeds, constraints, generations, arms }
+  const base = isFull
+    ? { instances: 100, seeds: [101, 202, 303], constraints: 8, generations: 3, arms: [...VALID_ARMS] }
+    : { instances: 10, seeds: [20261112], constraints: 6, generations: 2, arms: [...VALID_ARMS] }
+  return { ...base, ...overrides }
 }
 
 // ---------------------------------------------------------------------------

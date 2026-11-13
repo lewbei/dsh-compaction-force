@@ -550,6 +550,74 @@ export default { Type, DEFAULT_SCHEMA, load }
   assert(/prior-over-tight-basic: window 550000 -> ratio 0\.818182 >= 0\.8 \(effective ratio 0\.9\)/.test(priorOverrideRun.stdout), 'valid prior thresholdRatio must override tighter service thresholdRatio in skip diagnostics')
   assert(/tight-basic-skip: window 550000 -> compaction-basic thresholdRatio=0\.5 already tighter \(effective ratio 0\.5\)/.test(priorOverrideRun.stdout), 'model without prior thresholdRatio must cite compaction-basic thresholdRatio')
   ok('catalog-report mirrors BasicCompactionEngine headroom, budget checks, option coercion, pi-ai builtins, and dedup')
+
+  const runBench = (args) =>
+    spawnSync(node, [join(root, 'benchmarks/compint-run/retention-bench.mjs'), ...args], {
+      encoding: 'utf8',
+    })
+
+  for (const helpFlag of ['--help', '-h']) {
+    const helpRun = runBench([helpFlag])
+    assert.equal(helpRun.status, 0, helpRun.stderr)
+    assert(/Usage:/i.test(helpRun.stdout + helpRun.stderr), `${helpFlag} must print usage`)
+    assert(!helpRun.stdout.includes('| Arm |'), `${helpFlag} must not execute benchmark`)
+  }
+
+  const eqRun = runBench(['--instances=2', '--arms=handoff', '--constraints=4', '--generations=2', '--seeds=101'])
+  assert.equal(eqRun.status, 0, eqRun.stderr)
+  assert(eqRun.stdout.includes('seeds=101 instances/seed=2 constraints/scenario=4 generations=2 arms=handoff'), eqRun.stdout)
+  assert(eqRun.stdout.includes('| handoff | 100 % | 100 % | 8/8 |'), eqRun.stdout)
+
+  const zeroSeedRun = runBench(['--seeds', '0', '--instances', '1', '--arms', 'handoff'])
+  assert.equal(zeroSeedRun.status, 0, zeroSeedRun.stderr)
+  assert(zeroSeedRun.stdout.includes('seeds=0 instances/seed=1'), zeroSeedRun.stdout)
+
+  for (const fullArgs of [
+    ['--full', '--instances', '2', '--arms', 'handoff'],
+    ['--instances', '2', '--arms', 'handoff', '--full'],
+  ]) {
+    const fullOverrideRun = runBench(fullArgs)
+    assert.equal(fullOverrideRun.status, 0, fullOverrideRun.stderr)
+    assert(fullOverrideRun.stdout.includes('seeds=101,202,303 instances/seed=2 constraints/scenario=8 generations=3 arms=handoff'), fullOverrideRun.stdout)
+    assert(fullOverrideRun.stdout.includes('48/48'), fullOverrideRun.stdout)
+  }
+
+  const oneGenRun = runBench(['--generations', '1', '--instances', '2', '--arms', 'handoff'])
+  assert.equal(oneGenRun.status, 0, oneGenRun.stderr)
+  assert(oneGenRun.stdout.includes('12/12'), oneGenRun.stdout)
+  assert(!oneGenRun.stdout.includes('NaN'), oneGenRun.stdout)
+
+  const invalidBenchCases = [
+    ['--unknown-flag'],
+    ['unexpected-positional'],
+    ['--arms'],
+    ['--seeds'],
+    ['--instances'],
+    ['--arms', '--instances'],
+    ['--arms', 'bogus'],
+    ['--arms', ''],
+    ['--arms', 'handoff,'],
+    ['--arms', 'handoff,handoff'],
+    ['--seeds', ''],
+    ['--seeds', '101,,202'],
+    ['--seeds', 'abc'],
+    ['--seeds', '101,101'],
+    ['--instances', '0'],
+    ['--instances', '1.5'],
+    ['--constraints', '0'],
+    ['--constraints', '-1'],
+    ['--constraints', '20'],
+    ['--generations', '0'],
+    ['--instances', '1', '--instances', '2'],
+    ['--full=1'],
+    ['--full', '--full'],
+  ]
+  for (const badArgs of invalidBenchCases) {
+    const badRun = runBench(badArgs)
+    assert.notEqual(badRun.status, 0, `expected non-zero exit for ${JSON.stringify(badArgs)}`)
+    assert(!/TypeError/.test(badRun.stderr), `unexpected TypeError for ${JSON.stringify(badArgs)}: ${badRun.stderr}`)
+  }
+  ok('retention-bench validates CLI options, equals syntax, --full overrides, help, and error exits cleanly')
 } finally {
   rmSync(fixture, { recursive: true, force: true })
 }
