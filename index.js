@@ -140,8 +140,6 @@ export function buildPolicies(models, options = {}, context = {}) {
           : 'ratio'
     if (mode === 'tokens') {
       const retainTokens = prior?.retainTokens ?? serviceConfig.retainTokens
-      // Max possible threshold tokens is floor(window * thresholdRatio); any
-      // retained tail at/above it can never be valid, so shrink it explicitly.
       if (Number.isInteger(retainTokens) && retainTokens >= thresholdTokens) {
         policy.retainTokens = Math.max(Math.floor(thresholdTokens / 2), 0)
       }
@@ -151,11 +149,8 @@ export function buildPolicies(models, options = {}, context = {}) {
         : typeof serviceConfig.retainRatio === 'number' && Number.isFinite(serviceConfig.retainRatio)
           ? serviceConfig.retainRatio
           : DEFAULT_RETAIN_RATIO
-      // dsh-compaction-basic requires 0 < retain < threshold. Keep the usual
-      // rounding unless it collapses the gap at a tiny scaled threshold, and
-      // emit an explicit retention whenever the inherited ratio would be
-      // invalid under the new threshold.
-      if (thresholdRatio <= 0.16 || round6(inherited) >= thresholdRatio || Math.floor(window * inherited) >= thresholdTokens) {
+      // Match @deepseek-ai/dsh-compaction-basic validateRatioRetention + resolveCompactSpec.
+      if (!(inherited > 0) || inherited >= thresholdRatio || Math.floor(window * inherited) >= thresholdTokens) {
         policy.retainRatio = validRetention(thresholdRatio, window)
       }
     }
