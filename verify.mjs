@@ -886,6 +886,13 @@ await test('buildPolicies: preserves leaner inherited retainRatio when threshold
     { serviceConfig: { retainRatio: 0 } },
   )
   assert.equal(invalidZero[0].retainRatio, 0.065536)
+
+  const unroundedLean = buildPolicies(
+    [{ provider: 'p', model: 'unrounded', contextWindow: 2000000 }],
+    { forceAtTokens: 262144, minContextWindow: 500000 },
+    { serviceConfig: { retainRatio: 0.1310719 } },
+  )
+  assert.equal(unroundedLean[0].retainRatio, undefined)
 })
 
 console.log(`\n${passed} passed, ${failed} failed`)
