@@ -752,6 +752,87 @@ await test('extractSideConstraints: ignores framed <compacted-summary> sections 
   )
 })
 
+await test('extractSideConstraints: ignores inline, fenced, and unmatched <compacted-summary> delimiters', () => {
+  const inlineSummary = [
+    '## Files and Code',
+    '- parser.js: handles `</compacted-summary>` tags.',
+    '## Current Work',
+    '- Fixing </compacted-summary> parsing bug',
+    '## Critical Context',
+    '- Must not modify production database during migration.',
+  ].join('\n')
+  const inlineNote = buildNoteText({
+    variant: 'both',
+    summaryText: inlineSummary,
+    totalTokens: 120000,
+    sideConstraints: ['Never output </compacted-summary> in generated docs.'],
+  })
+  assert.deepEqual(
+    extractSideConstraints([{
+      role: 'user',
+      content: [
+        { type: 'text', text: 'Preamble\n\n<compacted-summary>' },
+        { type: 'text', text: inlineSummary },
+        { type: 'text', text: inlineNote },
+        { type: 'text', text: '</compacted-summary>' },
+      ],
+    }]),
+    ['Never output </compacted-summary> in generated docs.'],
+  )
+
+  assert.deepEqual(
+    extractSideConstraints([{
+      role: 'user',
+      content: [{ type: 'text', text: 'Remember: `<compacted-summary>` must always be closed by `</compacted-summary>` in tests.' }],
+    }]),
+    ['Remember: `<compacted-summary>` must always be closed by `</compacted-summary>` in tests.'],
+  )
+
+  assert.deepEqual(
+    extractSideConstraints([{
+      role: 'user',
+      content: [{
+        type: 'text',
+        text: '```markdown\n<compacted-summary>\n```\nNever deploy without approval.\n```markdown\n</compacted-summary>\n```',
+      }],
+    }]),
+    ['Never deploy without approval.'],
+  )
+
+  assert.deepEqual(
+    extractSideConstraints([{
+      role: 'user',
+      content: [{
+        type: 'text',
+        text: 'Note: <compacted-summary> marks spans.\nNever deploy without running tests.\n<compacted-summary>\n## Current Work\n- reading\n</compacted-summary>',
+      }],
+    }]),
+    ['Never deploy without running tests.'],
+  )
+
+  assert.deepEqual(
+    extractSideConstraints([{
+      role: 'user',
+      content: [{
+        type: 'text',
+        text: '<compacted-summary>\nNever deploy without running tests.\n<compacted-summary>\n## Critical Context\n- Must not leak.\n</compacted-summary>',
+      }],
+    }]),
+    ['Never deploy without running tests.'],
+  )
+
+  assert.deepEqual(
+    extractSideConstraints([{
+      role: 'user',
+      content: [{
+        type: 'text',
+        text: '<compacted-summary>\n## Current Work\n<compacted-summary>\n- Avoid inner leaks.\n</compacted-summary>\n## Critical Context\n- Never leak outer summary.\n</compacted-summary>\nAlways verify after compaction.',
+      }],
+    }]),
+    ['Always verify after compaction.'],
+  )
+})
+
 await test('extractSideConstraints: preserves wrapped multi-line user sentences', () => {
   const text = 'Please help me with deployment.\nAlways deploy changes\nto the staging server only.'
   const extracted = extractSideConstraints([{ role: 'user', content: [{ type: 'text', text }] }])
