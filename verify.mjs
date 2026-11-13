@@ -864,6 +864,30 @@ await test('apply: FIFO and partial-overlap disposal of instances leaves no zomb
   assert.deepEqual(engine.config.modelPolicies, [])
 })
 
+await test('buildPolicies: preserves leaner inherited retainRatio when thresholdRatio <= 0.16', () => {
+  const models = [{ provider: 'p', model: 'band', contextWindow: 1638400 }]
+  const serviceLean = buildPolicies(models, { forceAtTokens: 262144, minContextWindow: 500000 }, {
+    serviceConfig: { retainRatio: 0.05 },
+  })
+  assert.equal(serviceLean[0].thresholdRatio, 0.16)
+  assert.equal(serviceLean[0].retainRatio, undefined)
+
+  const rowLean = buildPolicies(
+    [{ provider: 'p', model: 'large', contextWindow: 2000000 }],
+    { forceAtTokens: 262144, minContextWindow: 500000 },
+    { previousRows: [{ provider: 'p', model: 'large', retainRatio: 0.01 }] },
+  )
+  assert.equal(rowLean[0].thresholdRatio, 0.131072)
+  assert.equal(rowLean[0].retainRatio, undefined)
+
+  const invalidZero = buildPolicies(
+    [{ provider: 'p', model: 'zero', contextWindow: 2000000 }],
+    { forceAtTokens: 262144, minContextWindow: 500000 },
+    { serviceConfig: { retainRatio: 0 } },
+  )
+  assert.equal(invalidZero[0].retainRatio, 0.065536)
+})
+
 console.log(`\n${passed} passed, ${failed} failed`)
 if (failed > 0) {
   process.exitCode = 1
