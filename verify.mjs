@@ -1175,6 +1175,176 @@ await test('apply: FIFO disposal across non-extensible Cordis proxies shares rec
   assert.deepEqual(targetEngine.config.modelPolicies, [])
 })
 
+await test('apply: multi-instance wrapper ownership survives FIFO disposal, option precedence, outer wrappers, non-extensible own summarize, and aborted signals', async () => {
+  const ORIGINAL = Symbol.for('cordis.original')
+  const baseEngine = makeEngine()
+  const wrapProxy = (target) => new Proxy(target, {
+    get(obj, prop, receiver) {
+      if (prop === ORIGINAL) return obj
+      return Reflect.get(obj, prop, receiver)
+    },
+    set(obj, prop, value, receiver) {
+      return Reflect.set(obj, prop, value, receiver)
+    },
+  })
+  const llm = makeLlm([])
+  const disposers = []
+  const mount = (engine, opts) => apply({
+    logs: [],
+    logger: { info() {}, warn() {} },
+    inject(names, cb) {
+      cb({
+        compaction: engine,
+        llm,
+        tokenMeter: { measure: () => ({ totalTokens: 10000 }) },
+        effect(fn) {
+          const d = fn()
+          disposers.push(d)
+          return d
+        },
+      })
+    },
+  }, opts)
+
+  mount(wrapProxy(baseEngine), { note: 'off' })
+  mount(wrapProxy(baseEngine), { note: 'handoff', heading: 'Layer Two' })
+
+  const input = { messages: [{ role: 'user', content: [{ type: 'text', text: 'Never skip tests.' }] }] }
+  const activeBoth = await baseEngine.summarize(input, {}, undefined)
+  assert.equal(activeBoth.summary.length, 2)
+  assert.match(activeBoth.summary[1].text, /## Layer Two/)
+
+  const inner = baseEngine.summarize
+  const outer = async function (...args) {
+    return { ...(await inner.apply(this, args)), outer: true }
+  }
+  baseEngine.summarize = outer
+
+  disposers[0]()
+  const afterFirst = await baseEngine.summarize(input, {}, undefined)
+  assert.equal(afterFirst.outer, true)
+  assert.equal(afterFirst.summary.length, 2)
+  assert.match(afterFirst.summary[1].text, /## Layer Two/)
+
+  disposers[1]()
+  const afterSecond = await baseEngine.summarize(input, {}, undefined)
+  assert.equal(baseEngine.summarize, outer)
+  assert.equal(afterSecond.outer, true)
+  assert.equal(afterSecond.summary.length, 1)
+
+  const sealedEngine = Object.preventExtensions(makeEngine())
+  const sealedOriginal = sealedEngine.summarize
+  const sealedDisposers = []
+  apply({
+    logs: [],
+    logger: { info() {}, warn() {} },
+    inject(names, cb) {
+      cb({
+        compaction: sealedEngine,
+        llm,
+        tokenMeter: { measure: () => ({ totalTokens: 10000 }) },
+        effect(fn) {
+          const d = fn()
+          sealedDisposers.push(d)
+          return d
+        },
+      })
+    },
+  }, { note: 'context' })
+  assert.notEqual(sealedEngine.summarize, sealedOriginal)
+  const ctrl = new AbortController()
+  ctrl.abort(new Error('stopped'))
+  const abortedResult = await sealedEngine.summarize(input, {}, ctrl.signal)
+  assert.equal(abortedResult.summary.length, 1)
+  sealedDisposers[0]()
+  assert.equal(sealedEngine.summarize, sealedOriginal)
+
+  const reallySealed = Object.seal(makeEngine())
+  const reallySealedOrig = reallySealed.summarize
+  const reallySealedDisposers = []
+  apply({
+    logs: [],
+    logger: { info() {}, warn() {} },
+    inject(names, cb) {
+      cb({
+        compaction: reallySealed,
+        llm,
+        tokenMeter: { measure: () => ({ totalTokens: 10000 }) },
+        effect(fn) {
+          const d = fn()
+          reallySealedDisposers.push(d)
+          return d
+        },
+      })
+    },
+  }, { note: 'context' })
+  assert.notEqual(reallySealed.summarize, reallySealedOrig)
+  reallySealedDisposers[0]()
+  assert.equal(reallySealed.summarize, reallySealedOrig)
+
+  const proto = { async summarize() { return { summary: [{ type: 'text', text: 'From proto.' }] } } }
+  const protoEngine = Object.create(proto)
+  protoEngine.config = Object.freeze({ modelPolicies: [] })
+  const protoDisposers = []
+  const mountProto = (opts) => apply({
+    logs: [],
+    logger: { info() {}, warn() {} },
+    inject(names, cb) {
+      cb({
+        compaction: protoEngine,
+        llm,
+        tokenMeter: { measure: () => ({ totalTokens: 10000 }) },
+        effect(fn) {
+          const d = fn()
+          protoDisposers.push(d)
+          return d
+        },
+      })
+    },
+  }, opts)
+  mountProto({ note: 'context' })
+  assert.equal(Object.hasOwn(protoEngine, 'summarize'), true)
+  mountProto({ note: 'handoff', heading: 'SecondProto' })
+  protoDisposers[1]()
+  protoDisposers[1]()
+  const afterLifo = await protoEngine.summarize(input, {}, undefined)
+  assert.match(afterLifo.summary[1].text, /Note to Self \(context\)/)
+  protoDisposers[0]()
+  assert.equal(Object.hasOwn(protoEngine, 'summarize'), false)
+
+  const frozenProtoEngine = Object.preventExtensions(Object.assign(Object.create(proto), {
+    config: Object.freeze({ modelPolicies: [] }),
+  }))
+  assert.equal(wrapSummarize(frozenProtoEngine, fakeCtx({}), { note: 'context' }), false)
+  assert.equal(Object.hasOwn(frozenProtoEngine, 'summarize'), false)
+
+  const sharedBase = makeEngine()
+  assert.equal(wrapSummarize(wrapProxy(sharedBase), fakeCtx({}), { note: 'context' }), true)
+  assert.equal(wrapSummarize(wrapProxy(sharedBase), fakeCtx({}), { note: 'context' }), false)
+  const overlayDisposers = []
+  apply({
+    logs: [],
+    logger: { info() {}, warn() {} },
+    inject(names, cb) {
+      cb({
+        compaction: sharedBase,
+        llm,
+        tokenMeter: { measure: () => ({ totalTokens: 10000 }) },
+        effect(fn) {
+          const d = fn()
+          overlayDisposers.push(d)
+          return d
+        },
+      })
+    },
+  }, { note: 'handoff', heading: 'Overlay' })
+  const overlayResult = await sharedBase.summarize(input, {}, undefined)
+  assert.match(overlayResult.summary[1].text, /## Overlay/)
+  overlayDisposers[0]()
+  const afterOverlay = await sharedBase.summarize(input, {}, undefined)
+  assert.match(afterOverlay.summary[1].text, /Note to Self \(context\)/)
+})
+
 console.log(`\n${passed} passed, ${failed} failed`)
 if (failed > 0) {
   process.exitCode = 1

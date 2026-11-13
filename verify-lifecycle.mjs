@@ -278,6 +278,58 @@ await test('disposing non-extensible Cordis Service proxies in FIFO order restor
   } finally { await ctx.fiber.dispose() }
 })
 
+await test('overlapping instances preserve active wrapper layer across FIFO disposal and outer wrappers on Cordis Service proxies', async () => {
+  const ctx = new Context()
+  ctx.provide('llm', catalog())
+  ctx.provide('tokenMeter', { measure: () => ({ totalTokens: 10000 }) })
+  ctx.provide('sessions', { registerMessageProjection: () => () => {} })
+  await ctx.plugin(BasicCompactionEngine, { auto: false })
+  const rawEngine = ctx.get('compaction')[Symbol.for('cordis.original')]
+  rawEngine.summarize = async function () {
+    return { summary: [{ type: 'text', text: '## Current Work\n- keep active wrapper' }] }
+  }
+  const scopeA = ctx.isolate('toolResultPruner')
+  const scopeB = ctx.isolate('toolResultPrunerB')
+  try {
+    const first = await scopeA.plugin(plugin, { note: 'off', forceAtTokens: 200000 })
+    const second = await scopeB.plugin(plugin, { note: 'handoff', heading: 'Second Active', forceAtTokens: 100000 })
+    await flush()
+
+    const duringBoth = await ctx.get('compaction').summarize(input, {}, signal)
+    assert.equal(duringBoth.summary.length, 2)
+    assert.match(duringBoth.summary[1].text, /## Second Active/)
+
+    const inner = rawEngine.summarize
+    const outer = async function (...args) {
+      return { ...(await inner.apply(this, args)), external: true }
+    }
+    rawEngine.summarize = outer
+
+    await first.dispose()
+    const afterFirst = await scopeB.get('compaction').summarize(input, {}, signal)
+    assert.equal(afterFirst.external, true)
+    assert.equal(afterFirst.summary.length, 2)
+    assert.match(afterFirst.summary[1].text, /## Second Active/)
+
+    await second.dispose()
+    assert.equal(rawEngine.summarize, outer)
+    const afterSecond = await ctx.get('compaction').summarize(input, {}, signal)
+    assert.equal(afterSecond.external, true)
+    assert.equal(afterSecond.summary.length, 1)
+
+    const protoCtx = new Context()
+    try {
+      protoCtx.provide('llm', catalog())
+      const protoEngine = new BasicCompactionEngine(protoCtx, { auto: false })
+      assert.equal(Object.hasOwn(protoEngine, 'summarize'), false)
+      const protoPlugin = await protoCtx.plugin(plugin, { note: 'off' })
+      assert.equal(Object.hasOwn(protoEngine, 'summarize'), true)
+      await protoPlugin.dispose()
+      assert.equal(Object.hasOwn(protoEngine, 'summarize'), false)
+    } finally { await protoCtx.fiber.dispose() }
+  } finally { await ctx.fiber.dispose() }
+})
+
 await test('tiny forceAtTokens policies never trigger TargetPressureConfigError during compactPressure', async () => {
   for (const [forceAtTokens, window] of [[1, 700000], [2, 600000]]) {
     const ctx = new Context()
