@@ -14,7 +14,7 @@ describes. Run it yourself: `node benchmarks/compint-run/retention-bench.mjs`.
 - **intact retention** — fraction found whose normalized wording is unchanged
   (standalone line/bullet).
 
-## Results (2026-11-12, at repo head after PR #8)
+## Results (2026-11-13T07:49:36Z, commit `d270716` with PRs #11–#30 applied)
 
 | Arm | Retention | Intact retention | found/total |
 |---|---:|---:|---:|
@@ -32,20 +32,24 @@ Observations:
   Constraints` section — the plugin re-injects side constraints regardless of
   the `note` variant (only `off` disables the note entirely).
 
-### Repeated-compaction experiment (handoff arm)
+### Repeated-compaction experiment (2 generations)
 
-A second compaction sees the first checkpoint as a framed replacement user
-message plus one new instruction. Fix 10/10 scenarios:
+Each generation sees the previous checkpoint as a framed replacement user
+message plus one new instruction. Measured across all 4 arms:
 
-- prior constraints surviving the second compaction: **10/10**;
-- a new instruction added before the second compaction surviving it: **10/10**.
+| Arm | All prior constraints survive | Per-constraint prior survival | Added instructions survive |
+|---|---:|---:|---:|
+| off | 0/10 scenarios | 0/60 (0 %) | 0/10 |
+| context | 10/10 scenarios | 60/60 (100 %) | 10/10 |
+| handoff | 10/10 scenarios | 60/60 (100 %) | 10/10 |
+| both | 10/10 scenarios | 60/60 (100 %) | 10/10 |
 
-> The initial run of this harness measured **0/10** for prior-constraint
-> survival, exposing a real defect: the section-skip heuristic treated the
-> plugin's own `Active Constraints` bullets as synthetic and dropped them, so a
-> lossy summarizer erased prior constraints at the next compaction. PR #8
-> fixes it by carrying genuine prior-constraint bullets forward while still
-> excluding the generated footer, headings, and context/handoff notes.
+> Historical regression fixed in PR #8: the initial harness measured **0/10**
+> for prior-constraint survival because the section-skip heuristic treated the
+> plugin's own `Active Constraints` bullets as synthetic and dropped them. PR #8
+> and subsequent hardening in PRs #20–#26 preserve genuine prior-constraint
+> bullets across balanced `<compacted-summary>` spans while still excluding
+> generated footers, headings, fences, and context/handoff notes.
 
 ## Limits
 

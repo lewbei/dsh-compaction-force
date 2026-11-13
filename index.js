@@ -1,7 +1,7 @@
 /**
  * @local/dsh-compaction-force — host half.
  *
- * Two capabilities for the Guarded preset:
+ * Two capabilities inside an isolated compaction scope or root profile:
  *
  * 1. **Early pressure compaction on large-context models.** For every model
  *    whose adapter reports `contextWindow > minContextWindow` (default

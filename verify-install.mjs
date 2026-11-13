@@ -618,6 +618,24 @@ export default { Type, DEFAULT_SCHEMA, load }
     assert(!/TypeError/.test(badRun.stderr), `unexpected TypeError for ${JSON.stringify(badArgs)}: ${badRun.stderr}`)
   }
   ok('retention-bench validates CLI options, equals syntax, --full overrides, help, and error exits cleanly')
+
+  const indexSrc = readFileSync(join(root, 'index.js'), 'utf8')
+  const readyDoc = readFileSync(join(root, 'READY'), 'utf8')
+  const resultsDoc = readFileSync(join(root, 'benchmarks/compint-run/RESULTS.md'), 'utf8')
+  const resultsFullDoc = readFileSync(join(root, 'benchmarks/compint-run/RESULTS-full.md'), 'utf8')
+  for (const [docName, text] of [
+    ['index.js', indexSrc],
+    ['README.md', readme],
+    ['READY', readyDoc],
+    ['cordis.patch.yml', template],
+  ]) {
+    assert(!/\bGuarded\b/.test(text), `${docName} must not reference nonexistent Guarded preset`)
+  }
+  assert(/\bstandard\b.*\bptc\b.*\bminimal\b.*\bcordis\b/i.test(readme), 'README must document real stock DSH presets')
+  assert(/75 assertions|75 passed|75\/75/.test(readme) && /14\s+real-Cordis|14\/14/.test(readme), 'README must state updated verifier counts')
+  assert(/75\/75/.test(readyDoc) && /14\/14/.test(readyDoc), 'READY must state updated verifier counts')
+  assert(!/at repo head after PR #8|at repo `3a171b0`/.test(resultsDoc + '\n' + resultsFullDoc), 'benchmark RESULTS must carry updated post-fix provenance rather than stale PR #8 / 3a171b0 claims')
+  ok('documentation accurately reflects real DSH presets, updated suite counts, and fresh benchmark provenance')
 } finally {
   rmSync(fixture, { recursive: true, force: true })
 }
