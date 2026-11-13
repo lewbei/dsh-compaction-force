@@ -36,11 +36,12 @@
     "verify-lifecycle.mjs",
     "verify-policy-boundaries.mjs",
     "catalog-report.mjs",
+    "cordis.bundle.patch.yml",
     "scripts/prepare-patch.mjs"
   ],
   "dsh": {
     "bundle": {
-      "patch": "./cordis.patch.yml"
+      "patch": "./cordis.bundle.patch.yml"
     }
   },
   "license": "MIT"

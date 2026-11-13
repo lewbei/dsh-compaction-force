@@ -1,0 +1,7 @@
+- insert:
+    - id: compaction-force
+      name: ./index.js
+      config:
+        forceAtTokens: 262144
+        minContextWindow: 500000
+        note: handoff
