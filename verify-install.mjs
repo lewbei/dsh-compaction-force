@@ -366,6 +366,190 @@ export default { Type, DEFAULT_SCHEMA, load }
   assert.notEqual(missingYamlRun.status, 0)
   assert(!/Cannot find module|node:internal\/modules/.test(missingYamlRun.stderr), 'missing yaml must fail cleanly without stacktrace')
   ok('catalog-report discovers non-guarded presets and root scopes dynamically, skips disabled rows, and handles non-hoisted yaml/js-yaml')
+
+  const fidelityPayload = [
+    { id: 'custom-ds-key', name: '@deepseek-ai/dsh-llm-deepseek-api-key', disabled: true, config: {} },
+    { id: 'llm-deepseek-account', name: '@deepseek-ai/dsh-llm-deepseek-account', config: { maxTokens: 64000, modelOverrides: { 'deepseek-flash': { contextWindow: 1200000 } } } },
+    {
+      id: 'llm-pi-ai',
+      config: {
+        providers: {
+          anthropic: {
+            apiKeyEnv: 'DUMMY',
+            modelOverrides: { 'claude-opus-4-6': { maxTokens: 64000 } },
+          },
+          'opencode-go': {
+            apiKeyEnv: 'DUMMY',
+          },
+          'custom-explicit': {
+            api: 'openai-completions',
+            baseURL: 'https://example.invalid/v1',
+            apiKeyEnv: 'DUMMY',
+            models: [
+              { id: 'big-reserve-model', contextWindow: 600000, maxTokens: 550000 },
+              { id: 'headroom-affected-model', contextWindow: 600000, maxTokens: 256000 },
+              { id: 'tight-existing-model', contextWindow: 1000000, maxTokens: 64000 },
+              { id: 'unconfigured-cap-model', contextWindow: 1000000 },
+              { id: 'zero-mt-invalid', contextWindow: 600000, maxTokens: 0 },
+              { id: 'retain-exceeds-threshold', contextWindow: 1000000, maxTokens: 64000 },
+            ],
+          },
+          'deepseek-official': {
+            api: 'openai-completions',
+            baseURL: 'https://example.invalid/v1',
+            apiKeyEnv: 'DUMMY',
+            models: [
+              { id: 'deepseek-flash', contextWindow: 2000000, maxTokens: 64000 },
+            ],
+          },
+        },
+      },
+    },
+    {
+      id: 'preset-guarded',
+      name: '@deepseek-ai/dsh-agent-preset',
+      config: {
+        id: 'guarded',
+        plugins: [
+          {
+            id: 'compaction',
+            group: true,
+            isolate: { compaction: true },
+            config: [
+              {
+                id: 'compaction-basic',
+                name: '@deepseek-ai/dsh-compaction-basic',
+                config: {
+                  headroomTokens: 131072,
+                  retainRatio: 0.2,
+                  modelPolicies: [
+                    { provider: 'custom-explicit', model: 'tight-existing-model', thresholdRatio: 0.2 },
+                    { provider: 'opencode-go', model: 'minimax-m3.1-flash', headroomTokens: 450000 },
+                    { provider: 'custom-explicit', model: 'retain-exceeds-threshold', retainTokens: 300000 },
+                  ],
+                },
+              },
+              {
+                id: 'compaction-force',
+                config: {
+                  forceAtTokens: '262144',
+                  minContextWindow: '500000',
+                  note: 'handoff',
+                },
+              },
+            ],
+          },
+        ],
+      },
+    },
+  ]
+  const fidelityRoot = createFakeDshRoot('dsh-fidelity', {
+    yamlPkgDir: join('node_modules', 'yaml'),
+    yamlCode: 'export default { parseDocument: (s) => ({ toJS: () => JSON.parse(s) }) }\n',
+    dshScript: `#!/bin/sh\necho '${JSON.stringify(fidelityPayload)}'\n`,
+  })
+  const fakePiAiDir = join(fidelityRoot, '@deepseek-ai', 'dsh-llm-pi-ai', 'node_modules', '@earendil-works', 'pi-ai', 'dist', 'providers')
+  mkdirSync(fakePiAiDir, { recursive: true })
+  mkdirSync(join(fidelityRoot, '@deepseek-ai', 'dsh-llm-pi-ai'), { recursive: true })
+  writeFileSync(join(fidelityRoot, '@deepseek-ai', 'dsh-llm-pi-ai', 'package.json'), '{"name":"@deepseek-ai/dsh-llm-pi-ai"}\n')
+  writeFileSync(
+    join(fakePiAiDir, 'all.js'),
+    `export function getBuiltinModels(p) {
+      if (p === "anthropic") return [{ id: "claude-opus-4-6", contextWindow: 1000000, maxTokens: 128000 }]
+      if (p === "opencode-go") return [{ id: "minimax-m3.1-flash", contextWindow: 1000000, maxTokens: 512000 }]
+      return []
+    }\n`,
+  )
+
+  const fidelityRun = runCatalogReport(['--profile', 'dev'], fidelityRoot)
+  assert.equal(fidelityRun.status, 0, fidelityRun.stderr)
+  assert(/anthropic\/claude-opus-4-6\s+1000000\s+64000\s+0\.262144\s+262144/.test(fidelityRun.stdout), 'builtin pi-ai model with modelOverrides must reserve overridden 64000 maxTokens')
+  assert(/opencode-go\/minimax-m3\.1-flash\s+1000000\s+0\s+0\.262144\s+262144/.test(fidelityRun.stdout), 'un-overridden builtin pi-ai model must reserve 0 (not builtin maxTokens)')
+  assert(/custom-explicit\/unconfigured-cap-model\s+1000000\s+0\s+0\.262144\s+262144/.test(fidelityRun.stdout), 'pi-ai route model omitting maxTokens must reserve 0')
+  assert(!fidelityRun.stdout.includes('zero-mt-invalid'), 'pi-ai model with maxTokens <= 0 must be excluded')
+  assert(fidelityRun.stdout.includes('custom-explicit/headroom-affected-model') && fidelityRun.stdout.includes('212928'), 'sibling headroomTokens=131072 must cap threshold to 212928')
+  assert(!fidelityRun.stdout.includes('-81072'), 'negative pressureBudget must not be rendered as negative threshold')
+  assert(fidelityRun.stdout.includes('custom-explicit/big-reserve-model') && /no pressure budget/i.test(fidelityRun.stdout), 'zero/negative pressureBudget must report no pressure budget')
+  assert(fidelityRun.stdout.includes('custom-explicit/retain-exceeds-threshold') && /retain .* >= threshold|no pressure budget/i.test(fidelityRun.stdout), 'retainTokens >= threshold must report unusable budget')
+  assert(/forced at 262144: [1-9]/.test(fidelityRun.stdout), 'string forceAtTokens must match integer thresholds')
+  assert(fidelityRun.stdout.includes('deepseek-account/deepseek-flash') && fidelityRun.stdout.includes('1200000'), 'enabled llm-deepseek-account must emit deepseek-account models with modelOverrides')
+  assert(fidelityRun.stdout.includes('deepseek-official/deepseek-flash') && !fidelityRun.stdout.includes('deepseek-official/deepseek-v4-pro'), 'disabled custom dsh-llm-deepseek-api-key must not seed deepseek-v4-pro while preserving explicit pi-ai route')
+  assert(fidelityRun.stdout.includes('custom-explicit/tight-existing-model') && /skipped/i.test(fidelityRun.stdout), 'tighter pre-existing threshold must stay skipped and visible')
+
+  const dedupPayload = [
+    { id: 'llm-deepseek', name: '@deepseek-ai/dsh-llm-deepseek-api-key', config: { maxTokens: 64000, models: [{ id: 'deepseek-flash', contextWindow: 1048576 }] } },
+    {
+      id: 'llm-pi-ai',
+      config: {
+        providers: {
+          'deepseek-official': {
+            models: [
+              { id: 'deepseek-flash', contextWindow: 2000000, maxTokens: 64000 },
+              { id: 'high-ratio-skip', contextWindow: 550000, maxTokens: 32000 },
+              { id: 'isolate-check', contextWindow: 600000, maxTokens: 100000 },
+            ],
+          },
+        },
+      },
+    },
+    { id: 'compaction-basic', name: '@deepseek-ai/dsh-compaction-basic', config: { headroomTokens: 200000 } },
+    {
+      id: 'isolated-group',
+      group: true,
+      isolate: { compaction: true },
+      config: [
+        { id: 'compaction-basic', name: '@deepseek-ai/dsh-compaction-basic', config: { thresholdRatio: 0 } },
+        { id: 'compaction-force', config: { forceAtTokens: 450000, minContextWindow: 500000 } },
+      ],
+    },
+  ]
+  const dedupRoot = createFakeDshRoot('dsh-dedup', {
+    yamlPkgDir: join('node_modules', 'yaml'),
+    yamlCode: 'export default { parseDocument: (s) => ({ toJS: () => JSON.parse(s) }) }\n',
+    dshScript: `#!/bin/sh\necho '${JSON.stringify(dedupPayload)}'\n`,
+  })
+  const dedupRun = runCatalogReport([], dedupRoot)
+  assert.equal(dedupRun.status, 0, dedupRun.stderr)
+  assert.equal(dedupRun.stdout.match(/deepseek-official\/deepseek-flash/g)?.length ?? 0, 1, 'duplicate provider/model must appear once with overridden contextWindow')
+  assert(!dedupRun.stdout.includes('deepseek-v4-pro'), 'custom llm-deepseek models list must not inject default deepseek-v4-pro')
+  assert(dedupRun.stdout.includes('2000000'))
+  assert(dedupRun.stdout.includes('434464') && dedupRun.stdout.includes('headroom 65536'), 'isolate.compaction=true must block parent compaction-basic headroomTokens')
+  assert(dedupRun.stdout.includes('deepseek-official/high-ratio-skip') && /ratio 0\.818182 >= 0\.8 \(effective ratio 0\.8\)/.test(dedupRun.stdout), 'invalid thresholdRatio <= 0 must fall back to 0.8 in skip diagnostics')
+
+  const priorOverridePayload = [
+    {
+      id: 'llm-pi-ai',
+      config: {
+        providers: {
+          'custom-explicit': {
+            models: [
+              { id: 'prior-over-tight-basic', contextWindow: 550000, maxTokens: 32000 },
+              { id: 'tight-basic-skip', contextWindow: 550000, maxTokens: 32000 },
+            ],
+          },
+        },
+      },
+    },
+    {
+      id: 'compaction-basic',
+      name: '@deepseek-ai/dsh-compaction-basic',
+      config: {
+        thresholdRatio: 0.5,
+        modelPolicies: [{ provider: 'custom-explicit', model: 'prior-over-tight-basic', thresholdRatio: 0.9 }],
+      },
+    },
+    { id: 'compaction-force', config: { forceAtTokens: 450000, minContextWindow: 500000 } },
+  ]
+  const priorOverrideRoot = createFakeDshRoot('dsh-prior-override', {
+    yamlPkgDir: join('node_modules', 'yaml'),
+    yamlCode: 'export default { parseDocument: (s) => ({ toJS: () => JSON.parse(s) }) }\n',
+    dshScript: `#!/bin/sh\necho '${JSON.stringify(priorOverridePayload)}'\n`,
+  })
+  const priorOverrideRun = runCatalogReport([], priorOverrideRoot)
+  assert.equal(priorOverrideRun.status, 0, priorOverrideRun.stderr)
+  assert(/prior-over-tight-basic: window 550000 -> ratio 0\.818182 >= 0\.8 \(effective ratio 0\.9\)/.test(priorOverrideRun.stdout), 'valid prior thresholdRatio must override tighter service thresholdRatio in skip diagnostics')
+  assert(/tight-basic-skip: window 550000 -> compaction-basic thresholdRatio=0\.5 already tighter \(effective ratio 0\.5\)/.test(priorOverrideRun.stdout), 'model without prior thresholdRatio must cite compaction-basic thresholdRatio')
+  ok('catalog-report mirrors BasicCompactionEngine headroom, budget checks, option coercion, pi-ai builtins, and dedup')
 } finally {
   rmSync(fixture, { recursive: true, force: true })
 }

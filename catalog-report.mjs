@@ -9,17 +9,16 @@
  *
  * The plugin itself enumerates the catalog at runtime through
  * llm.listProviders()/listModels()/resolveModelInfo(); this script instead reads
- * the composed configuration (pi-ai routes) plus the two known dsh-llm-deepseek
- * routes, applies the same policy math, and shows which models really reach the
- * forced threshold. Reservation = the model's declared maxTokens (the value the
- * adapter materializes into the routed request header); headroom = 65,536.
+ * the composed configuration (pi-ai and deepseek routes), applies the same
+ * policy math with compaction-basic headroom/retention defaults, and shows which
+ * models really reach the forced threshold.
  */
 import { existsSync, realpathSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { createRequire } from 'node:module'
-import { dirname, join, resolve } from 'node:path'
-import { fileURLToPath } from 'node:url'
-import { buildPolicies } from './index.js'
+import { basename, dirname, join, resolve } from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
+import { buildPolicies, normalizeOptions } from './index.js'
 
 function printUsage() {
   console.error(`Usage: node catalog-report.mjs [--profile <name>] [--preset <id>]
@@ -69,11 +68,13 @@ function parseArgs(argv) {
   return { profile: values.profile ?? 'web', preset: values.preset }
 }
 
-const { profile, preset: targetPreset } = parseArgs(process.argv.slice(2))
-const HEADROOM = 65536
-const DEEPSEEK_ROUTES = [
-  { provider: 'deepseek-official', model: 'deepseek-flash', contextWindow: 1048576, maxTokens: 256000 },
-  { provider: 'deepseek-official', model: 'deepseek-v4-pro', contextWindow: 1048576, maxTokens: 256000 },
+const DEFAULT_HEADROOM = 65536
+const DEFAULT_RETAIN_RATIO = 0.16
+const DEFAULT_THRESHOLD_RATIO = 0.8
+const round6 = (value) => Math.round(value * 1e6) / 1e6
+const DEEPSEEK_DEFAULT_MODELS = [
+  { id: 'deepseek-flash', contextWindow: 1048576 },
+  { id: 'deepseek-v4-pro', contextWindow: 1048576 },
 ]
 
 function isInstallRootCandidate(dir) {
@@ -182,27 +183,211 @@ function isCompactionForceRow(row) {
   )
 }
 
-function collectScopes(rows, scopeLabel, presetId, allScopes, checkedPresets) {
+function isCompactionBasicRow(row) {
+  return isPlainRow(row) && (row.id === 'compaction-basic' || row.name === '@deepseek-ai/dsh-compaction-basic')
+}
+
+function isPiAiRow(row) {
+  return isPlainRow(row) && (row.id === 'llm-pi-ai' || row.name === '@deepseek-ai/dsh-llm-pi-ai')
+}
+
+function isDeepseekApiKeyRow(row) {
+  return isPlainRow(row) && (
+    row.id === 'llm-deepseek' ||
+    row.id === 'llm-deepseek-api-key' ||
+    row.name === '@deepseek-ai/dsh-llm-deepseek' ||
+    row.name === '@deepseek-ai/dsh-llm-deepseek-api-key'
+  )
+}
+
+function isDeepseekAccountRow(row) {
+  return isPlainRow(row) && (row.id === 'llm-deepseek-account' || row.name === '@deepseek-ai/dsh-llm-deepseek-account')
+}
+
+async function loadPiAiCatalog(root) {
+  const tryLoad = async (base) => {
+    for (const candidate of [
+      join(base, '@earendil-works', 'pi-ai', 'dist', 'providers', 'all.js'),
+      join(base, 'node_modules', '@earendil-works', 'pi-ai', 'dist', 'providers', 'all.js'),
+    ]) {
+      if (!existsSync(candidate)) continue
+      try {
+        return await import(pathToFileURL(candidate).href)
+      } catch {}
+    }
+    return null
+  }
+  const direct = await tryLoad(root)
+  if (direct) return direct
+  const pkgPaths = [
+    join(root, '@deepseek-ai', 'dsh-llm-pi-ai'),
+    join(root, '@deepseek-ai', 'dsh-app-boot'),
+    join(root, '@deepseek-ai', 'dsh-web-app'),
+    join(root, '@deepseek-ai', 'dsh'),
+  ]
+  for (const pkgPath of pkgPaths) {
+    if (!existsSync(pkgPath)) continue
+    let dir = realpathSync(pkgPath)
+    for (let depth = 0; depth < 6; depth += 1) {
+      const loaded = await tryLoad(dir)
+      if (loaded) return loaded
+      const parent = dirname(dir)
+      if (parent === dir) break
+      if (basename(dir) === 'node_modules' && !dir.includes('.pnpm')) break
+      dir = parent
+    }
+  }
+  return null
+}
+
+function collectScopes(rows, scopeLabel, presetId, allScopes, checkedPresets, inheritedBasic = null) {
   if (!Array.isArray(rows)) return
+  const localBasic = rows.find((r) => isCompactionBasicRow(r) && r.disabled !== true)
+  const basicRow = localBasic ?? inheritedBasic
+  const basicConfig = isPlainRow(basicRow?.config) ? basicRow.config : {}
   for (const row of rows) {
     if (!isPlainRow(row)) continue
     if (isPresetRow(row)) {
       const id = row.config?.id ?? row.id
       if (typeof id === 'string') checkedPresets.push(id)
       if (row.disabled !== true) {
-        collectScopes(row.config?.plugins, `Preset ${id}`, id, allScopes, checkedPresets)
+        collectScopes(row.config?.plugins, `Preset ${id}`, id, allScopes, checkedPresets, null)
       }
       continue
     }
     if (row.disabled === true) continue
     if (isCompactionForceRow(row)) {
-      allScopes.push({ scopeLabel, presetId, force: row })
+      allScopes.push({ scopeLabel, presetId, force: row, basicConfig })
     } else if (Array.isArray(row.config)) {
-      collectScopes(row.config, scopeLabel, presetId, allScopes, checkedPresets)
+      const nextBasic = row.isolate?.compaction === true ? null : basicRow
+      collectScopes(row.config, scopeLabel, presetId, allScopes, checkedPresets, nextBasic)
     }
   }
 }
 
+function collectProviderRows(rows, targetPresetId, state) {
+  if (!Array.isArray(rows)) return
+  for (const row of rows) {
+    if (!isPlainRow(row)) continue
+    if (isPresetRow(row)) {
+      const id = row.config?.id ?? row.id
+      if (row.disabled !== true && targetPresetId !== null && id === targetPresetId) {
+        collectProviderRows(row.config?.plugins, targetPresetId, state)
+      }
+      continue
+    }
+    if (row.disabled === true) continue
+    if (isDeepseekApiKeyRow(row)) {
+      state.deepseekApiKeyRows.push(row)
+    } else if (isDeepseekAccountRow(row)) {
+      state.deepseekAccountRows.push(row)
+    } else if (isPiAiRow(row)) {
+      state.piAiRows.push(row)
+    } else if (Array.isArray(row.config)) {
+      collectProviderRows(row.config, targetPresetId, state)
+    }
+  }
+}
+
+function addDeepseekRouteModels(modelMap, provider, entries, defaultWindow, routeMaxTokens) {
+  for (const entry of entries) {
+    if (!isPlainRow(entry) || typeof entry.id !== 'string' || entry.id.length === 0) continue
+    const contextWindow = entry.contextWindow ?? defaultWindow
+    const maxTokens = entry.maxTokens ?? routeMaxTokens
+    if (!Number.isInteger(contextWindow) || contextWindow <= 0) continue
+    if (!Number.isInteger(maxTokens) || maxTokens <= 0) continue
+    modelMap.set(`${provider}\u0000${entry.id}`, {
+      provider,
+      model: entry.id,
+      contextWindow,
+      maxTokens,
+      reservedTokens: maxTokens,
+    })
+  }
+}
+
+function resolveModels(composed, targetPresetId, piAiCatalog) {
+  const providerState = { piAiRows: [], deepseekApiKeyRows: [], deepseekAccountRows: [] }
+  collectProviderRows(composed, targetPresetId, providerState)
+  const modelMap = new Map()
+  for (const dsRow of providerState.deepseekApiKeyRows) {
+    const cfg = isPlainRow(dsRow.config) ? dsRow.config : {}
+    const defaultWindow = Number.isInteger(cfg.defaultContextWindow) && cfg.defaultContextWindow > 0 ? cfg.defaultContextWindow : 1000000
+    const routeMaxTokens = Number.isInteger(cfg.maxTokens) && cfg.maxTokens > 0 ? cfg.maxTokens : 256000
+    const entries = Array.isArray(cfg.models) ? cfg.models : DEEPSEEK_DEFAULT_MODELS
+    addDeepseekRouteModels(modelMap, 'deepseek-official', entries, defaultWindow, routeMaxTokens)
+  }
+  for (const dsRow of providerState.deepseekAccountRows) {
+    const cfg = isPlainRow(dsRow.config) ? dsRow.config : {}
+    const defaultWindow = Number.isInteger(cfg.defaultContextWindow) && cfg.defaultContextWindow > 0 ? cfg.defaultContextWindow : 1000000
+    const routeMaxTokens = Number.isInteger(cfg.maxTokens) && cfg.maxTokens > 0 ? cfg.maxTokens : 256000
+    const overrides = isPlainRow(cfg.modelOverrides) ? cfg.modelOverrides : {}
+    const entries = DEEPSEEK_DEFAULT_MODELS.map((m) => ({
+      ...m,
+      ...(isPlainRow(overrides[m.id]) ? overrides[m.id] : {}),
+      id: m.id,
+    }))
+    addDeepseekRouteModels(modelMap, 'deepseek-account', entries, defaultWindow, routeMaxTokens)
+  }
+  for (const piAi of providerState.piAiRows) {
+    for (const [provider, route] of Object.entries(piAi?.config?.providers ?? {})) {
+      if (!isPlainRow(route)) continue
+      const builtinList = typeof piAiCatalog?.getBuiltinModels === 'function' ? piAiCatalog.getBuiltinModels(provider) : []
+      const defaults = new Map((Array.isArray(builtinList) ? builtinList : []).map((m) => [m.id, m]))
+      const configured = Array.isArray(route.models) ? route.models : []
+      const overrides = isPlainRow(route.modelOverrides) ? route.modelOverrides : {}
+      const entries = configured.length > 0
+        ? configured
+        : [...defaults.values()].map((m) => ({ id: m.id, ...(isPlainRow(overrides[m.id]) ? overrides[m.id] : {}) }))
+      for (const entry of entries) {
+        if (!isPlainRow(entry) || typeof entry.id !== 'string' || entry.id.length === 0) continue
+        const base = defaults.get(entry.id)
+        const contextWindow = entry.contextWindow ?? base?.contextWindow ?? route.defaultContextWindow ?? 1000000
+        const maxTokens = entry.maxTokens ?? base?.maxTokens ?? route.defaultMaxTokens ?? 128000
+        if (!Number.isInteger(contextWindow) || contextWindow <= 0) continue
+        if (!Number.isInteger(maxTokens) || maxTokens <= 0) continue
+        modelMap.set(`${provider}\u0000${entry.id}`, {
+          provider,
+          model: entry.id,
+          contextWindow,
+          maxTokens,
+          reservedTokens: Number.isInteger(entry.maxTokens) ? entry.maxTokens : 0,
+        })
+      }
+    }
+  }
+  return [...modelMap.values()]
+}
+
+function isPositiveRatio(value) {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0
+}
+
+function resolveRetainTokens(policy, prior, basicConfig, messageBudget) {
+  if (policy.retainTokens !== undefined) return policy.retainTokens
+  if (policy.retainRatio !== undefined) return Math.floor(messageBudget * policy.retainRatio)
+  if (prior?.retainTokens !== undefined) return prior.retainTokens
+  if (prior?.retainRatio !== undefined) return Math.floor(messageBudget * prior.retainRatio)
+  if (Number.isInteger(basicConfig.retainTokens)) return basicConfig.retainTokens
+  const ratio = isPositiveRatio(basicConfig.retainRatio)
+    ? basicConfig.retainRatio
+    : DEFAULT_RETAIN_RATIO
+  return Math.floor(messageBudget * ratio)
+}
+
+function describeSkipReason(model, forceAtTokens, prior, basicConfig) {
+  const ratio = round6(forceAtTokens / model.contextWindow)
+  if (model.contextWindow <= forceAtTokens) return `window <= forceAtTokens (${forceAtTokens})`
+  if (isPositiveRatio(prior?.thresholdRatio)) {
+    if (ratio >= prior.thresholdRatio) return `existing policy thresholdRatio=${prior.thresholdRatio} already tighter`
+  } else if (isPositiveRatio(basicConfig.thresholdRatio) && ratio >= basicConfig.thresholdRatio) {
+    return `compaction-basic thresholdRatio=${basicConfig.thresholdRatio} already tighter`
+  }
+  if (ratio >= DEFAULT_THRESHOLD_RATIO) return `ratio ${ratio} >= ${DEFAULT_THRESHOLD_RATIO}`
+  return 'not emitted by buildPolicies'
+}
+
+const { profile, preset: targetPreset } = parseArgs(process.argv.slice(2))
 const root = installRoot()
 const localDsh = join(root, '.bin', 'dsh')
 const dshBin = existsSync(localDsh) ? localDsh : 'dsh'
@@ -236,56 +421,115 @@ if (matchingScopes.length === 0) {
   process.exit(1)
 }
 
-const { scopeLabel, force } = matchingScopes[0]
+const { scopeLabel, presetId: selectedPresetId, force, basicConfig } = matchingScopes[0]
 if (matchingScopes.length > 1) {
   const others = matchingScopes.slice(1).map((entry) => entry.scopeLabel).join(', ')
   console.log(`Multiple active compaction-force scopes found; reporting ${scopeLabel} (others: ${others}; pass --preset <id> to select)`)
 }
-const forceAtTokens = force.config?.forceAtTokens ?? 262144
-const minContextWindow = force.config?.minContextWindow ?? 500000
-console.log(`${scopeLabel} compaction-force: forceAtTokens=${forceAtTokens} minContextWindow=${minContextWindow} note=${force.config?.note ?? 'handoff'}`)
+const opts = normalizeOptions(force.config)
+const { forceAtTokens, minContextWindow, note } = opts
+console.log(`${scopeLabel} compaction-force: forceAtTokens=${forceAtTokens} minContextWindow=${minContextWindow} note=${note}`)
 
-const models = [...DEEPSEEK_ROUTES]
-const piAi = composed.find((row) => row?.id === 'llm-pi-ai')
-for (const [provider, route] of Object.entries(piAi?.config?.providers ?? {})) {
-  for (const model of route?.models ?? []) {
-    if (Number.isInteger(model?.contextWindow) && Number.isInteger(model?.maxTokens)) {
-      models.push({ provider, model: model.id, contextWindow: model.contextWindow, maxTokens: model.maxTokens })
-    }
-  }
+const piAiCatalog = await loadPiAiCatalog(root)
+const models = resolveModels(composed, selectedPresetId, piAiCatalog)
+
+const existingPolicies = Array.isArray(basicConfig.modelPolicies) ? basicConfig.modelPolicies.filter(isPlainRow) : []
+const existingByKey = new Map()
+for (const policy of existingPolicies) {
+  const key = `${policy.provider}\u0000${policy.model}`
+  if (!existingByKey.has(key)) existingByKey.set(key, policy)
 }
-
-// Use the plugin's own policy builder so filtering and retention math stay
-// identical to what installPolicies actually installs.
-const policies = buildPolicies(models, { forceAtTokens, minContextWindow })
+const policies = buildPolicies(models, opts, { previousRows: existingPolicies, serviceConfig: basicConfig })
 const policyByKey = new Map(policies.map((policy) => [`${policy.provider}\u0000${policy.model}`, policy]))
 const rows = []
+const skipped = []
+const unusable = []
+const untouched = []
 for (const model of models) {
-  if (!Number.isInteger(model.contextWindow) || model.contextWindow <= minContextWindow) continue
-  const policy = policyByKey.get(`${model.provider}\u0000${model.model}`)
-  if (policy === undefined) continue
-  const pressureBudget = model.contextWindow - model.maxTokens - HEADROOM
+  if (!Number.isInteger(model.contextWindow) || model.contextWindow <= minContextWindow) {
+    untouched.push(model)
+    continue
+  }
+  const key = `${model.provider}\u0000${model.model}`
+  const policy = policyByKey.get(key)
+  const prior = existingByKey.get(key)
+  if (policy === undefined) {
+    const effectiveRatio = isPositiveRatio(prior?.thresholdRatio)
+      ? prior.thresholdRatio
+      : (isPositiveRatio(basicConfig.thresholdRatio) ? basicConfig.thresholdRatio : DEFAULT_THRESHOLD_RATIO)
+    skipped.push({ ...model, effectiveRatio, reason: describeSkipReason(model, forceAtTokens, prior, basicConfig) })
+    continue
+  }
+  const reserved = model.reservedTokens
+  const headroom = Number.isInteger(prior?.headroomTokens) && prior.headroomTokens >= 0
+    ? prior.headroomTokens
+    : (Number.isInteger(basicConfig.headroomTokens) && basicConfig.headroomTokens >= 0 ? basicConfig.headroomTokens : DEFAULT_HEADROOM)
+  const messageBudget = model.contextWindow - reserved
+  const pressureBudget = messageBudget - headroom
+  if (messageBudget <= 0 || pressureBudget <= 0) {
+    unusable.push({
+      ...model,
+      reserved,
+      ratio: policy.thresholdRatio,
+      headroom,
+      reason: messageBudget <= 0 ? 'no message budget (reserve >= window)' : 'no pressure budget (reserve + headroom >= window)',
+    })
+    continue
+  }
   const threshold = Math.floor(Math.min(policy.thresholdRatio * model.contextWindow, pressureBudget))
-  rows.push({ ...model, ratio: policy.thresholdRatio, retention: policy.retainRatio ?? policy.retainTokens ?? null, threshold, pct: (100 * threshold) / model.contextWindow })
+  const retainTokens = resolveRetainTokens(policy, prior, basicConfig, messageBudget)
+  if (threshold <= 0 || retainTokens >= threshold) {
+    unusable.push({
+      ...model,
+      reserved,
+      ratio: policy.thresholdRatio,
+      headroom,
+      reason: threshold <= 0 ? 'non-positive threshold' : `no pressure budget (retain ${retainTokens} >= threshold ${threshold})`,
+    })
+    continue
+  }
+  const pct = (100 * threshold) / model.contextWindow
+  const targetThreshold = Math.floor(policy.thresholdRatio * model.contextWindow)
+  const budgetLimited = pressureBudget < targetThreshold
+  rows.push({
+    ...model,
+    reserved,
+    ratio: policy.thresholdRatio,
+    headroom,
+    threshold,
+    pct,
+    budgetLimited,
+  })
 }
 rows.sort((a, b) => a.threshold - b.threshold || a.provider.localeCompare(b.provider))
 
-const forced = rows.filter((row) => row.threshold === forceAtTokens)
-const lower = rows.filter((row) => row.threshold !== forceAtTokens)
-const untouched = models.filter((model) => !Number.isInteger(model.contextWindow) || model.contextWindow <= minContextWindow)
+const forced = rows.filter((row) => !row.budgetLimited)
+const lower = rows.filter((row) => row.budgetLimited)
 
-console.log(`\nmodels > ${minContextWindow} window: ${rows.length} (forced at ${forceAtTokens}: ${forced.length}, lower because reserve+headroom leaves less: ${lower.length})`)
+const summaryExtras = []
+if (skipped.length > 0) summaryExtras.push(`skipped by compaction-force: ${skipped.length}`)
+if (unusable.length > 0) summaryExtras.push(`no pressure budget: ${unusable.length}`)
+const extraSuffix = summaryExtras.length > 0 ? `, ${summaryExtras.join(', ')}` : ''
+console.log(`\nmodels > ${minContextWindow} window: ${rows.length} (forced at ${forceAtTokens}: ${forced.length}, lower because reserve+headroom leaves less: ${lower.length}${extraSuffix})`)
 console.log(`models <= ${minContextWindow} window left untouched: ${untouched.length}`)
 if (rows.length > 0) {
   console.log('\nprovider/model                       window      max   ratio     threshold   pct')
   for (const row of rows.slice(0, 40)) {
     console.log(
-      `${(row.provider + '/' + row.model).padEnd(36)} ${String(row.contextWindow).padStart(8)} ${String(row.maxTokens).padStart(8)} ${row.ratio.toFixed(6)} ${String(row.threshold).padStart(10)} ${row.pct.toFixed(1).padStart(5)}%`,
+      `${(row.provider + '/' + row.model).padEnd(36)} ${String(row.contextWindow).padStart(8)} ${String(row.reserved).padStart(8)} ${row.ratio.toFixed(6)} ${String(row.threshold).padStart(10)} ${row.pct.toFixed(1).padStart(5)}%`,
     )
   }
   if (rows.length > 40) console.log(`... ${rows.length - 40} more`)
 }
 if (lower.length > 0) {
-  console.log('\nNot reaching the forced threshold (declared output cap + 64K headroom eats the budget):')
-  for (const row of lower.slice(0, 12)) console.log(`  ${row.provider}/${row.model}: window ${row.contextWindow}, maxTokens ${row.maxTokens} -> threshold ${row.threshold} (${row.pct.toFixed(1)}%)`)
+  console.log('\nNot reaching the forced threshold (declared output cap + headroom eats the budget):')
+  for (const row of lower.slice(0, 12)) console.log(`  ${row.provider}/${row.model}: window ${row.contextWindow}, maxTokens ${row.reserved}, headroom ${row.headroom} -> threshold ${row.threshold} (${row.pct.toFixed(1)}%)`)
+}
+if (unusable.length > 0) {
+  console.log('\nNo usable pressure budget (BasicCompactionEngine TargetPressureConfigError):')
+  for (const row of unusable.slice(0, 12)) console.log(`  ${row.provider}/${row.model}: window ${row.contextWindow}, maxTokens ${row.reserved}, headroom ${row.headroom} -> ${row.reason}`)
+}
+if (skipped.length > 0) {
+  console.log('\nSkipped by compaction-force:')
+  for (const row of skipped.slice(0, 12)) console.log(`  ${row.provider}/${row.model}: window ${row.contextWindow} -> ${row.reason} (effective ratio ${row.effectiveRatio})`)
 }
