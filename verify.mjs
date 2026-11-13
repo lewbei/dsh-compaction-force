@@ -966,6 +966,86 @@ await test('collectCatalog: awaits async listProviders, handles rejections and i
   assert.equal(unhandled, null)
 })
 
+await test('catalogFor and apply: unwrap Cordis proxy keys, avoid poisoning empty cache, preserve cache on filter miss, and refresh on adapters-updated', async () => {
+  const ORIGINAL = Symbol.for('cordis.original')
+  const baseLlm = makeLlm([{ provider: 'a', model: 'small', window: 100000 }])
+  const proxyA = new Proxy(baseLlm, {
+    get(target, prop, receiver) {
+      if (prop === ORIGINAL) return target
+      const value = Reflect.get(target, prop, receiver)
+      return typeof value === 'function' ? value.bind(target) : value
+    },
+  })
+  const proxyB = new Proxy(baseLlm, {
+    get(target, prop, receiver) {
+      if (prop === ORIGINAL) return target
+      const value = Reflect.get(target, prop, receiver)
+      return typeof value === 'function' ? value.bind(target) : value
+    },
+  })
+  await catalogFor(proxyA)
+  await catalogFor(proxyB)
+  assert.equal(baseLlm.calls.resolve, 1)
+
+  const strictCtx = {
+    logs: [],
+    logger: { info() {}, warn() {} },
+    inject(names, cb) { cb({ compaction: makeEngine(), llm: proxyA, effect: (fn) => fn() }) },
+  }
+  apply(strictCtx, { minContextWindow: 500000 })
+  await tick()
+  await catalogFor(proxyB)
+  assert.equal(baseLlm.calls.resolve, 1)
+
+  let ready = false
+  const lateLlm = {
+    listProviders: () => [{ id: 'late', name: 'late' }],
+    listModels: async () => (ready ? [{ provider: 'late', id: 'big', name: 'big' }] : []),
+    resolveModelInfo: async () => ({ provider: 'late', id: 'big', context: { contextWindow: 1000000 } }),
+  }
+  assert.deepEqual(await catalogFor(lateLlm), [])
+  ready = true
+  assert.deepEqual(await catalogFor(lateLlm), [{ provider: 'late', model: 'big', contextWindow: 1000000 }])
+
+  let dynamicCatalog = [{ provider: 'a', model: 'm1', window: 1000000 }]
+  const dynamicLlm = {
+    listProviders: () => [{ id: 'a', name: 'a' }],
+    listModels: async () => dynamicCatalog.map((m) => ({ provider: m.provider, id: m.model, name: m.model })),
+    resolveModelInfo: async (provider, model) => {
+      const hit = dynamicCatalog.find((m) => m.provider === provider && m.model === model)
+      return { provider, id: model, context: { contextWindow: hit.window } }
+    },
+  }
+  const engine = makeEngine()
+  const listeners = new Set()
+  const eventCtx = {
+    logs: [],
+    logger: { info() {}, warn() {} },
+    inject(names, cb) {
+      cb({
+        compaction: engine,
+        llm: dynamicLlm,
+        on(event, fn) {
+          if (event === 'llm/adapters-updated') listeners.add(fn)
+          return () => listeners.delete(fn)
+        },
+        effect: (fn) => fn(),
+      })
+    },
+  }
+  const dispose = apply(eventCtx, { forceAtTokens: 200000, minContextWindow: 500000 })
+  await tick()
+  assert.deepEqual(engine.config.modelPolicies.map((p) => p.model), ['m1'])
+  dynamicCatalog = [
+    { provider: 'a', model: 'm1', window: 1000000 },
+    { provider: 'a', model: 'm2', window: 1000000 },
+  ]
+  for (const fn of listeners) fn()
+  await tick()
+  assert.deepEqual(engine.config.modelPolicies.map((p) => p.model), ['m1', 'm2'])
+  if (typeof dispose === 'function') dispose()
+})
+
 console.log(`\n${passed} passed, ${failed} failed`)
 if (failed > 0) {
   process.exitCode = 1
