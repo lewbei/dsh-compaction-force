@@ -14,7 +14,7 @@
  */
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, chmodSync } from 'node:fs'
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync, chmodSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -142,31 +142,230 @@ try {
   assert(nlRun.stdout.includes(`name: ${JSON.stringify(nlModule)}`), 'newline path must be JSON-escaped inside YAML scalar')
   ok('prepare-patch handles flag ordering, = syntax, help, unknown flags, write errors, and newline paths')
 
-  const missingProfile = spawnSync(node, [join(root, 'catalog-report.mjs'), '--profile'], { encoding: 'utf8' })
+  const runCatalogReport = (args, dshRoot = '') =>
+    spawnSync(node, [join(root, 'catalog-report.mjs'), ...args], {
+      encoding: 'utf8',
+      env: { ...process.env, PATH: '/usr/bin:/bin', DSH_INSTALL_ROOT: dshRoot },
+    })
+
+  const createFakeDshRoot = (name, { yamlPkgDir, yamlPkgName = 'yaml', yamlCode, dshScript }) => {
+    const dir = join(fixture, name)
+    mkdirSync(join(dir, '@deepseek-ai', 'dsh-web-app', 'presets'), { recursive: true })
+    mkdirSync(join(dir, '.bin'), { recursive: true })
+    writeFileSync(join(dir, '@deepseek-ai', 'dsh-web-app', 'presets', 'standard.patch.yml'), '- id: standard\n')
+    if (yamlPkgDir && yamlCode) {
+      const modDir = join(dir, yamlPkgDir)
+      mkdirSync(modDir, { recursive: true })
+      writeFileSync(join(modDir, 'index.js'), yamlCode)
+      writeFileSync(join(modDir, 'package.json'), JSON.stringify({ name: yamlPkgName, main: './index.js' }) + '\n')
+    }
+    const stubDsh = join(dir, '.bin', 'dsh')
+    writeFileSync(stubDsh, dshScript)
+    chmodSync(stubDsh, 0o755)
+    return dir
+  }
+
+  const missingProfile = runCatalogReport(['--profile'])
   assert.notEqual(missingProfile.status, 0, '--profile without argument must exit non-zero')
   assert(!/profile "undefined"/.test(missingProfile.stderr), '--profile without argument must fail before invoking dsh')
   ok('catalog-report rejects --profile without a name')
 
-  const fakeRoot = join(fixture, 'dsh-root')
-  mkdirSync(join(fakeRoot, '@deepseek-ai', 'dsh-web-app', 'presets'), { recursive: true })
-  mkdirSync(join(fakeRoot, '.bin'), { recursive: true })
-  mkdirSync(join(fakeRoot, 'node_modules', 'yaml'), { recursive: true })
-  writeFileSync(join(fakeRoot, '@deepseek-ai', 'dsh-web-app', 'presets', 'standard.patch.yml'), '- id: guarded\n')
-  writeFileSync(join(fakeRoot, 'node_modules', 'yaml', 'index.js'), 'export default { parseDocument: () => ({ toJS: () => [] }) }\n')
-  writeFileSync(join(fakeRoot, 'node_modules', 'yaml', 'package.json'), '{"name":"yaml","main":"./index.js"}\n')
-  const stubDsh = join(fakeRoot, '.bin', 'dsh')
-  writeFileSync(stubDsh, `#!/bin/sh
-echo "stub-dsh-called:$*" >&2
-exit 2
-`)
-  chmodSync(stubDsh, 0o755)
-  const reportRun = spawnSync(node, [join(root, 'catalog-report.mjs'), '--profile', 'fake'], {
-    encoding: 'utf8',
-    env: { ...process.env, PATH: '/usr/bin:/bin', DSH_INSTALL_ROOT: fakeRoot },
+  const fakeRoot = createFakeDshRoot('dsh-root', {
+    yamlPkgDir: join('node_modules', 'yaml'),
+    yamlCode: 'export default { parseDocument: () => ({ toJS: () => [] }) }\n',
+    dshScript: '#!/bin/sh\necho "stub-dsh-called:$*" >&2\nexit 2\n',
   })
+  const reportRun = runCatalogReport(['--profile', 'fake'], fakeRoot)
   assert.notEqual(reportRun.status, 0)
   assert(reportRun.stderr.includes('stub-dsh-called:--profile fake --dump-config'), `expected resolved .bin/dsh stderr, got: ${reportRun.stderr}`)
   ok('catalog-report invokes resolved DSH_INSTALL_ROOT/.bin/dsh even when dsh is off PATH')
+
+  const helpReport = runCatalogReport(['--help'])
+  assert.equal(helpReport.status, 0, helpReport.stderr)
+  assert(/Usage:/i.test(helpReport.stderr + helpReport.stdout))
+
+  const noRootReport = runCatalogReport([])
+  assert.notEqual(noRootReport.status, 0)
+  assert(!/at installRoot/.test(noRootReport.stderr), 'missing DSH root must not emit raw stacktrace')
+
+  const invalidRootReport = runCatalogReport([], join(fixture, 'does-not-exist'))
+  assert.notEqual(invalidRootReport.status, 0)
+  assert(invalidRootReport.stderr.includes('DSH_INSTALL_ROOT'))
+
+  const nestedBogusSubdir = join(fakeRoot, 'nested-subdir', 'leaf')
+  mkdirSync(nestedBogusSubdir, { recursive: true })
+  for (const badRoot of [nestedBogusSubdir, '   ']) {
+    const strictFail = runCatalogReport([], badRoot)
+    assert.notEqual(strictFail.status, 0, `explicit DSH_INSTALL_ROOT=${JSON.stringify(badRoot)} must fail without ancestor fallback`)
+    assert(strictFail.stderr.includes('DSH_INSTALL_ROOT'))
+  }
+
+  for (const badArgs of [
+    ['--bogus'],
+    ['--profile', '-x'],
+    ['--profile='],
+    ['--profile', 'a', '--profile', 'b'],
+    ['--preset', '-x'],
+    ['--preset='],
+    ['--preset', 'a', '--preset', 'b'],
+    ['extra-arg'],
+  ]) {
+    const badRun = runCatalogReport(badArgs, fakeRoot)
+    assert.notEqual(badRun.status, 0, `${JSON.stringify(badArgs)} must fail`)
+    assert(!badRun.stderr.includes('stub-dsh-called:'), `${JSON.stringify(badArgs)} must fail before calling dsh`)
+  }
+  ok('catalog-report CLI validates help, flags, values, and missing DSH root cleanly')
+
+  const rowsPayload = [
+    {
+      id: 'preset-disabled',
+      name: '@deepseek-ai/dsh-agent-preset',
+      disabled: true,
+      config: {
+        id: 'offpreset',
+        plugins: [{ id: 'compaction-force', config: { forceAtTokens: 888888, minContextWindow: 500000 } }],
+      },
+    },
+    {
+      id: 'preset-minimal',
+      name: '@deepseek-ai/dsh-agent-preset',
+      config: {
+        id: 'minimal',
+        plugins: [
+          {
+            id: 'compaction',
+            group: true,
+            isolate: { compaction: true },
+            config: [
+              { id: 'compaction-force', disabled: true, config: { forceAtTokens: 999999, minContextWindow: 500000 } },
+            ],
+          },
+          {
+            id: 'compaction-disabled-group',
+            group: true,
+            disabled: true,
+            config: [{ id: 'compaction-force', config: { forceAtTokens: 777777, minContextWindow: 500000 } }],
+          },
+        ],
+      },
+    },
+    {
+      id: 'preset-standard',
+      name: '@deepseek-ai/dsh-agent-preset',
+      config: {
+        id: 'standard',
+        plugins: [
+          {
+            id: 'compaction',
+            group: true,
+            isolate: { compaction: true },
+            config: [
+              { id: 'compaction-force', config: { forceAtTokens: 262144, minContextWindow: 500000, note: 'handoff' } },
+            ],
+          },
+        ],
+      },
+    },
+    {
+      id: 'nested-presets-group',
+      group: true,
+      config: [
+        {
+          id: 'preset-custom',
+          name: '@deepseek-ai/dsh-agent-preset',
+          config: {
+            id: 'custom',
+            plugins: [
+              {
+                id: 'compaction',
+                group: true,
+                config: [{ id: 'compaction-force', config: { forceAtTokens: 333333, minContextWindow: 500000, note: 'context' } }],
+              },
+            ],
+          },
+        },
+      ],
+    },
+  ]
+  const dynamicRoot = createFakeDshRoot('dsh-dynamic', {
+    yamlPkgDir: join('@deepseek-ai', 'dsh-config-editor', 'node_modules', 'yaml'),
+    yamlCode: 'export default { parseDocument: (s) => ({ toJS: () => JSON.parse(s) }) }\n',
+    dshScript: `#!/bin/sh\necho '${JSON.stringify(rowsPayload)}'\n`,
+  })
+
+  const dynamicRun = runCatalogReport(['--profile=dev'], dynamicRoot)
+  assert.equal(dynamicRun.status, 0, `expected dynamic preset report to succeed: ${dynamicRun.stderr}`)
+  assert(dynamicRun.stdout.includes('Multiple active compaction-force scopes found; reporting Preset standard (others: Preset custom; pass --preset <id> to select)'))
+  assert(dynamicRun.stdout.includes('Preset standard compaction-force: forceAtTokens=262144'))
+  for (const forbidden of ['999999', '888888', '777777']) {
+    assert(!dynamicRun.stdout.includes(forbidden), `disabled compaction-force row ${forbidden} must be skipped`)
+  }
+
+  const targetedPreset = runCatalogReport(['--profile', 'dev', '--preset', 'custom'], dynamicRoot)
+  assert.equal(targetedPreset.status, 0, `expected --preset custom to succeed: ${targetedPreset.stderr}`)
+  assert(targetedPreset.stdout.includes('Preset custom compaction-force: forceAtTokens=333333'))
+  assert(!targetedPreset.stdout.includes('Multiple active compaction-force scopes found'))
+
+  for (const target of ['minimal', 'offpreset']) {
+    const disabledTarget = runCatalogReport(['--profile', 'dev', `--preset=${target}`], dynamicRoot)
+    assert.notEqual(disabledTarget.status, 0, `disabled preset target ${target} must fail`)
+  }
+
+  const rootPayload = [
+    { id: 'compaction-force', config: { forceAtTokens: 300000, minContextWindow: 500000, note: 'handoff' } },
+  ]
+  const jsYamlParent = join(fixture, 'parent-nm-root')
+  const jsYamlNm = join(jsYamlParent, 'node_modules')
+  mkdirSync(join(jsYamlNm, '@deepseek-ai', 'dsh-app-boot', 'node_modules', 'yaml'), { recursive: true })
+  mkdirSync(join(jsYamlNm, '@deepseek-ai', 'dsh-app-boot', 'node_modules', 'js-yaml'), { recursive: true })
+  mkdirSync(join(jsYamlNm, '.bin'), { recursive: true })
+  writeFileSync(join(jsYamlNm, '@deepseek-ai', 'dsh-app-boot', 'package.json'), '{"name":"@deepseek-ai/dsh-app-boot"}\n')
+  writeFileSync(join(jsYamlNm, '@deepseek-ai', 'dsh-app-boot', 'node_modules', 'yaml', 'package.json'), '{"name":"yaml","main":"./index.js"}\n')
+  writeFileSync(join(jsYamlNm, '@deepseek-ai', 'dsh-app-boot', 'node_modules', 'yaml', 'index.js'), 'export default {}\n')
+  writeFileSync(join(jsYamlNm, '@deepseek-ai', 'dsh-app-boot', 'node_modules', 'js-yaml', 'package.json'), '{"name":"js-yaml","main":"./index.js"}\n')
+  writeFileSync(
+    join(jsYamlNm, '@deepseek-ai', 'dsh-app-boot', 'node_modules', 'js-yaml', 'index.js'),
+    `
+class Type { constructor(tag, opts) { this.tag = tag; this.opts = opts } }
+const DEFAULT_SCHEMA = { extend(tags) { return { tags } } }
+function load(s, opts) {
+  const tags = opts?.schema?.tags?.map((t) => t.tag) ?? []
+  for (const req of ['tag:yaml.org,2002:js', 'tag:yaml.org,2002:js/undefined', 'tag:yaml.org,2002:js/regexp', 'tag:yaml.org,2002:js/function']) {
+    if (!tags.includes(req)) throw new Error('missing ' + req)
+  }
+  return JSON.parse(s)
+}
+export default { Type, DEFAULT_SCHEMA, load }
+`,
+  )
+  writeFileSync(join(jsYamlNm, '.bin', 'dsh'), `#!/bin/sh\necho '${JSON.stringify(rootPayload)}'\n`)
+  chmodSync(join(jsYamlNm, '.bin', 'dsh'), 0o755)
+
+  const jsYamlRun = runCatalogReport(['--profile', 'headless'], jsYamlParent)
+  assert.equal(jsYamlRun.status, 0, `expected js-yaml + nestedNm + root scope report to succeed: ${jsYamlRun.stderr}`)
+  assert(jsYamlRun.stdout.includes('Profile root compaction-force: forceAtTokens=300000'))
+
+  const pnpmRoot = join(fixture, 'pnpm-root')
+  const pnpmStoreMod = join(pnpmRoot, '.pnpm', 'dsh-pkg', 'node_modules')
+  mkdirSync(join(pnpmStoreMod, '@deepseek-ai', 'dsh'), { recursive: true })
+  mkdirSync(join(pnpmStoreMod, 'yaml'), { recursive: true })
+  mkdirSync(join(pnpmRoot, '@deepseek-ai'), { recursive: true })
+  mkdirSync(join(pnpmRoot, '.bin'), { recursive: true })
+  writeFileSync(join(pnpmStoreMod, '@deepseek-ai', 'dsh', 'package.json'), '{"name":"@deepseek-ai/dsh"}\n')
+  writeFileSync(join(pnpmStoreMod, 'yaml', 'package.json'), '{"name":"yaml","main":"./index.js"}\n')
+  writeFileSync(join(pnpmStoreMod, 'yaml', 'index.js'), 'export default { parseDocument: (s) => ({ toJS: () => JSON.parse(s) }) }\n')
+  symlinkSync(join(pnpmStoreMod, '@deepseek-ai', 'dsh'), join(pnpmRoot, '@deepseek-ai', 'dsh'))
+  writeFileSync(join(pnpmRoot, '.bin', 'dsh'), `#!/bin/sh\necho '${JSON.stringify(rootPayload)}'\n`)
+  chmodSync(join(pnpmRoot, '.bin', 'dsh'), 0o755)
+  const pnpmRun = runCatalogReport([], pnpmRoot)
+  assert.equal(pnpmRun.status, 0, `expected symlinked pnpm store root to succeed: ${pnpmRun.stderr}`)
+  assert(pnpmRun.stdout.includes('Profile root compaction-force: forceAtTokens=300000'))
+
+  rmSync(join(dynamicRoot, '@deepseek-ai', 'dsh-config-editor'), { recursive: true, force: true })
+  const missingYamlRun = runCatalogReport([], dynamicRoot)
+  assert.notEqual(missingYamlRun.status, 0)
+  assert(!/Cannot find module|node:internal\/modules/.test(missingYamlRun.stderr), 'missing yaml must fail cleanly without stacktrace')
+  ok('catalog-report discovers non-guarded presets and root scopes dynamically, skips disabled rows, and handles non-hoisted yaml/js-yaml')
 } finally {
   rmSync(fixture, { recursive: true, force: true })
 }
