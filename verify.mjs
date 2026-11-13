@@ -919,8 +919,12 @@ await test('buildPolicies and apply: preserve tighter thresholds and tolerate nu
 
 await test('collectCatalog: awaits async listProviders, handles rejections and iterables, deduplicates entries', async () => {
   const asyncIterableLlm = {
-    async listProviders() { return new Set([{ id: 'p' }, { id: 'p' }]) },
-    async listModels() { return new Set([{ id: 'm' }, { id: 'm' }]) },
+    listModelsCalls: 0,
+    async listProviders() { return new Set([{ id: 'p' }, 'p']) },
+    async listModels() {
+      this.listModelsCalls += 1
+      return new Set([{ id: 'm' }, 'm'])
+    },
     resolveCalls: 0,
     async resolveModelInfo(provider, model) {
       this.resolveCalls += 1
@@ -929,16 +933,35 @@ await test('collectCatalog: awaits async listProviders, handles rejections and i
   }
   const catalog = await collectCatalog(asyncIterableLlm)
   assert.deepEqual(catalog, [{ provider: 'p', model: 'm', contextWindow: 1000000 }])
+  assert.equal(asyncIterableLlm.listModelsCalls, 1)
   assert.equal(asyncIterableLlm.resolveCalls, 1)
+
+  const throwingIteratorLlm = {
+    listProviders() {
+      return {
+        *[Symbol.iterator]() {
+          yield 'p'
+          throw new Error('iterator boom')
+        },
+      }
+    },
+    async listModels() { return ['m'] },
+    async resolveModelInfo(provider, model) { return { provider, id: model, context: { contextWindow: 1000000 } } },
+  }
+  assert.deepEqual(await collectCatalog(throwingIteratorLlm), [{ provider: 'p', model: 'm', contextWindow: 1000000 }])
 
   let unhandled = null
   const onUnhandled = (reason) => { unhandled = reason }
   process.once('unhandledRejection', onUnhandled)
-  const failedCatalog = await collectCatalog({
-    listProviders: () => Promise.reject(new Error('rpc transport failed')),
-  })
-  await tick()
-  process.removeListener('unhandledRejection', onUnhandled)
+  let failedCatalog
+  try {
+    failedCatalog = await collectCatalog({
+      listProviders: () => Promise.reject(new Error('rpc transport failed')),
+    })
+    await tick()
+  } finally {
+    process.removeListener('unhandledRejection', onUnhandled)
+  }
   assert.deepEqual(failedCatalog, [])
   assert.equal(unhandled, null)
 })

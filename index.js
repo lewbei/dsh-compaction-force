@@ -161,37 +161,53 @@ export function buildPolicies(models, options = {}, context = {}) {
   return policies
 }
 
+const iterableEntries = (value) => (
+  value !== null && value !== undefined && typeof value !== 'string' && typeof value[Symbol.iterator] === 'function'
+    ? value
+    : []
+)
+
 /** Read every registered provider's advertised models with their context windows. */
 export async function collectCatalog(llm) {
   const entries = []
+  if (typeof llm?.listProviders !== 'function') return entries
   let providers = []
   try {
-    providers = typeof llm?.listProviders === 'function' ? llm.listProviders() : []
+    providers = await llm.listProviders()
   } catch {
     return entries
   }
-  for (const providerInfo of Array.isArray(providers) ? providers : []) {
-    const provider = typeof providerInfo === 'string' ? providerInfo : providerInfo?.id
-    if (typeof provider !== 'string' || provider.length === 0) continue
-    let models = []
-    try {
-      models = await llm.listModels(provider)
-    } catch {
-      continue
-    }
-    for (const modelInfo of Array.isArray(models) ? models : []) {
-      const model = modelInfo?.id
-      if (typeof model !== 'string' || model.length === 0) continue
+  if (typeof llm?.listModels !== 'function' || typeof llm?.resolveModelInfo !== 'function') return entries
+  const seenProviders = new Set()
+  const seen = new Set()
+  try {
+    for (const providerInfo of iterableEntries(providers)) {
+      const provider = typeof providerInfo === 'string' ? providerInfo : providerInfo?.id
+      if (typeof provider !== 'string' || provider.length === 0) continue
+      if (seenProviders.has(provider)) continue
+      seenProviders.add(provider)
+      let models = []
       try {
-        const info = await llm.resolveModelInfo(provider, model)
-        const window = info?.context?.contextWindow
-        if (Number.isInteger(window) && window > 0) entries.push({ provider, model, contextWindow: window })
+        models = await llm.listModels(provider)
       } catch {
-        // A route without a resolvable model (offline adapter, stale catalog)
-        // is skipped; the remaining models still get policies.
+        continue
       }
+      try {
+        for (const modelInfo of iterableEntries(models)) {
+          const model = typeof modelInfo === 'string' ? modelInfo : modelInfo?.id
+          if (typeof model !== 'string' || model.length === 0) continue
+          const key = `${provider}\u0000${model}`
+          if (seen.has(key)) continue
+          seen.add(key)
+          try {
+            const info = await llm.resolveModelInfo(provider, model)
+            const window = info?.context?.contextWindow
+            if (Number.isInteger(window) && window > 0) entries.push({ provider, model, contextWindow: window })
+          } catch {}
+        }
+      } catch {}
     }
-  }
+  } catch {}
   return entries
 }
 
