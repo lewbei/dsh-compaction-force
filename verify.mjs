@@ -2174,6 +2174,41 @@ await test('extractSideConstraints: sentence segmentation runs in linear time on
   assert.ok(repeatedMs < 200, `expected linear repeated sentence splitting, took ${repeatedMs.toFixed(1)}ms`)
 })
 
+await test('extractSideConstraints: stack-frame and error-header matching runs in linear time without backtracking ReDoS', () => {
+  const cases = [
+    [`Always check.\nat a${' '.repeat(50000)}x`, ['Always check.']],
+    [`Always check.\nat f (${'/a'.repeat(25000)}`, ['Always check.']],
+    [`Always check.\nat ${'fn (foo '.repeat(6000)}a.js:1:1`, ['Always check.']],
+    [`Always check.\na@${'a/'.repeat(25000)}`, ['Always check.']],
+    [`at a (a.js:1:1)\nUncaught${' (a)'.repeat(24)}`, []],
+    [`at a (a.js:1:1)\nUncaught${' ('.repeat(100000)}`, []],
+  ]
+  for (const [text, expected] of cases) {
+    const start = performance.now()
+    const got = extractSideConstraints([{ role: 'user', content: text }])
+    const elapsedMs = performance.now() - start
+    assert.deepEqual(got, expected)
+    assert.ok(elapsedMs < 150, `expected linear stack/error check, took ${elapsedMs.toFixed(1)}ms`)
+  }
+  assert.deepEqual(extractSideConstraints([{
+    role: 'user',
+    content: [
+      'Crash log:',
+      'Uncaught (in promise) TypeError: must not mutate config',
+      'Uncaught (a)(b) Error: must not ignore chained parens',
+      'Uncaught (a)b Error: must not skip glued suffix',
+      'Uncaught (in promise): Error: must not reject colon after group',
+      '  at Foo.bar() (/tmp/dir(1)/app.js:10:2)',
+      '  at render (Native Method)',
+      '  at helper (Unknown Source)',
+      '  fn@file:///app/index.js:12:4',
+      '  run@https://example.com/bundle.js:1:9',
+      '  native@[native code]',
+      'Always log structured stack traces.',
+    ].join('\n'),
+  }]), ['Always log structured stack traces.'])
+})
+
 console.log(`\n${passed} passed, ${failed} failed`)
 if (failed > 0) {
   process.exitCode = 1
