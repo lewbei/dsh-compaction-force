@@ -661,5 +661,134 @@ await test('dynamic LlmRuntime window shrink or removal and tighter-then-looser 
   }
 })
 
+await test('unmounted LlmRuntime adapters-updated invalidates catalogCache cleanly without leaking root listeners', async () => {
+  const { LlmRuntime } = await import(pathToFileURL(join(modules, '@deepseek-ai/dsh-llm/lib/index.js')))
+  const modelsMap = new Map([['m1', 1000000]])
+  let listCalls = 0
+  const resolveModel = async (_p, model) => {
+    const cw = modelsMap.get(model)
+    return cw ? { provider: 'p1', id: model, name: model, context: { contextWindow: cw }, defaultMaxTokens: 1000 } : undefined
+  }
+  const adapter = {
+    providerInfo: (id) => ({ id, name: id }),
+    providerRetryPolicy: () => undefined,
+    listModels: async () => {
+      listCalls += 1
+      return [...modelsMap.keys()].map((id) => ({ provider: 'p1', id, name: id }))
+    },
+    resolveModel,
+    prepareCall: async (p, model) => ({ model: await resolveModel(p, model), async *stream() {} }),
+    imageRequestPricing: () => undefined,
+    fileRequestText: (ref) => `[file:${ref?.id ?? 'x'}]`,
+  }
+
+  const ctx = new Context()
+  await ctx.plugin(LlmRuntime)
+  await flush()
+  const regHandle = ctx.get('llm').registerAdapter(['p1'], adapter)
+  ctx.provide('tokenMeter', { measure: () => ({ totalTokens: 10000 }) })
+  ctx.provide('sessions', { registerMessageProjection: () => () => {} })
+  await ctx.plugin(BasicCompactionEngine, { auto: false })
+  const engine = ctx.get('compaction')
+  const originalConfig = engine.config
+  try {
+    const f1 = await ctx.plugin(plugin, { note: 'off', forceAtTokens: 200000, minContextWindow: 500000 })
+    await flush()
+    assert.equal(listCalls, 1)
+    assert.deepEqual(engine.config.modelPolicies.map((p) => p.model), ['m1'])
+    await f1.dispose()
+    assert.equal(engine.config, originalConfig)
+    assert.equal(ctx.events._hooks['llm/adapters-updated'], undefined)
+
+    modelsMap.set('m2', 2000000)
+    regHandle.replace(['p1'])
+    await flush()
+
+    const f2 = await ctx.plugin(plugin, { note: 'off', forceAtTokens: 200000, minContextWindow: 500000 })
+    await flush()
+    assert.equal(listCalls, 2)
+    assert.deepEqual(engine.config.modelPolicies.map((p) => [p.model, p.thresholdRatio]), [['m1', 0.2], ['m2', 0.1]])
+
+    const scopeA = ctx.isolate('toolResultPruner')
+    const fOverlap = await scopeA.plugin(plugin, { note: 'off', forceAtTokens: 100000, minContextWindow: 500000 })
+    await flush()
+    assert.equal(listCalls, 2)
+    assert.deepEqual(engine.config.modelPolicies.map((p) => [p.model, p.thresholdRatio]), [['m1', 0.1], ['m2', 0.05]])
+
+    await f2.dispose()
+    const scopeB = ctx.isolate('toolResultPrunerB')
+    const fOverlap2 = await scopeB.plugin(plugin, { note: 'off', forceAtTokens: 150000, minContextWindow: 500000 })
+    await flush()
+    assert.equal(listCalls, 2)
+
+    await fOverlap.dispose()
+    await fOverlap2.dispose()
+    assert.equal(engine.config, originalConfig)
+    assert.equal(ctx.events._hooks['llm/adapters-updated'], undefined)
+  } finally {
+    await ctx.fiber.dispose()
+  }
+})
+
+await test('in-flight collectCatalog unmounted before resolution never repopulates stale cache after remount', async () => {
+  const { LlmRuntime } = await import(pathToFileURL(join(modules, '@deepseek-ai/dsh-llm/lib/index.js')))
+  let firstStarted
+  let releaseFirst
+  const firstReady = new Promise((resolve) => { firstStarted = resolve })
+  const firstGate = new Promise((resolve) => { releaseFirst = resolve })
+  let callNum = 0
+  let modelsMap = new Map([['m1', 1000000]])
+  const resolveModel = async (_p, model) => {
+    const cw = modelsMap.get(model)
+    return cw ? { provider: 'p1', id: model, name: model, context: { contextWindow: cw }, defaultMaxTokens: 1000 } : undefined
+  }
+  const adapter = {
+    providerInfo: (id) => ({ id, name: id }),
+    providerRetryPolicy: () => undefined,
+    listModels: async () => {
+      callNum += 1
+      if (callNum === 1) {
+        const snapshot = [...modelsMap.keys()]
+        firstStarted()
+        await firstGate
+        return snapshot.map((id) => ({ provider: 'p1', id, name: id }))
+      }
+      return [...modelsMap.keys()].map((id) => ({ provider: 'p1', id, name: id }))
+    },
+    resolveModel,
+    prepareCall: async (p, model) => ({ model: await resolveModel(p, model), async *stream() {} }),
+    imageRequestPricing: () => undefined,
+    fileRequestText: (ref) => `[file:${ref?.id ?? 'x'}]`,
+  }
+
+  const ctx = new Context()
+  await ctx.plugin(LlmRuntime)
+  await flush()
+  const regHandle = ctx.get('llm').registerAdapter(['p1'], adapter)
+  ctx.provide('tokenMeter', { measure: () => ({ totalTokens: 10000 }) })
+  ctx.provide('sessions', { registerMessageProjection: () => () => {} })
+  await ctx.plugin(BasicCompactionEngine, { auto: false })
+  const engine = ctx.get('compaction')
+  try {
+    const f1 = await ctx.plugin(plugin, { note: 'off', forceAtTokens: 200000, minContextWindow: 500000 })
+    await firstReady
+    await f1.dispose()
+
+    modelsMap = new Map([['m1', 1000000], ['m2', 2000000]])
+    regHandle.replace(['p1'])
+    releaseFirst()
+    await flush()
+    await flush()
+
+    const f2 = await ctx.plugin(plugin, { note: 'off', forceAtTokens: 200000, minContextWindow: 500000 })
+    await flush()
+    assert.deepEqual(engine.config.modelPolicies.map((p) => p.model), ['m1', 'm2'])
+    await f2.dispose()
+  } finally {
+    releaseFirst()
+    await ctx.fiber.dispose()
+  }
+})
+
 console.log(`${passed} passed, ${failed} failed (real Cordis lifecycle and shipped engine; controlled catalog and summarizer)`)
 if (failed) process.exitCode = 1

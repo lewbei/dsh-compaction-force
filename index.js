@@ -49,6 +49,37 @@ const CATALOG_TTL_MS = 5 * 60 * 1000
 
 /** Cached provider/model catalog per llm service, with an in-flight promise. */
 const catalogCache = new WeakMap()
+const activeCatalogWatchers = new WeakMap()
+const UNKEYED_EMITTER = {}
+
+const addCatalogWatcher = (llmKey, emitterKey, token) => {
+  if (llmKey === null) return
+  let byEmitter = activeCatalogWatchers.get(llmKey)
+  if (byEmitter === undefined) {
+    byEmitter = new Map()
+    activeCatalogWatchers.set(llmKey, byEmitter)
+  }
+  let tokens = byEmitter.get(emitterKey)
+  if (tokens === undefined) {
+    tokens = new Set()
+    byEmitter.set(emitterKey, tokens)
+  }
+  tokens.add(token)
+}
+
+const removeCatalogWatcher = (llmKey, emitterKey, token) => {
+  if (llmKey === null) return
+  const byEmitter = activeCatalogWatchers.get(llmKey)
+  if (byEmitter === undefined) return
+  const tokens = byEmitter.get(emitterKey)
+  if (tokens === undefined) return
+  tokens.delete(token)
+  if (tokens.size === 0) {
+    byEmitter.delete(emitterKey)
+    if (byEmitter.size === 0) activeCatalogWatchers.delete(llmKey)
+    catalogCache.delete(llmKey)
+  }
+}
 
 const unwrapService = (value) => {
   let current = value
@@ -1518,6 +1549,8 @@ export function apply(ctx, config = {}) {
       let everApplied = false
       const timers = new Set()
       const llmKey = llm !== null && typeof llm === 'object' ? unwrapService(llm) : null
+      const rawEvents = isObjectRecord(scope.events) ? unwrapService(scope.events) : null
+      const emitterKey = isObjectRecord(rawEvents) ? rawEvents : UNKEYED_EMITTER
       const installLoop = async (initialAttempt) => {
         if (!active) return
         if (inFlight) {
@@ -1577,10 +1610,13 @@ export function apply(ctx, config = {}) {
             void installLoop(0)
           })
         : null
+      const watchToken = typeof scope.on === 'function' && llmKey !== null ? {} : null
+      if (watchToken !== null) addCatalogWatcher(llmKey, emitterKey, watchToken)
       void installLoop(0)
       return () => {
         active = false
         try { if (typeof unsubscribe === 'function') unsubscribe() } catch {}
+        if (watchToken !== null) removeCatalogWatcher(llmKey, emitterKey, watchToken)
         for (const timer of timers) globalThis.clearTimeout(timer)
         timers.clear()
         try {
