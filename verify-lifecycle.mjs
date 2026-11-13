@@ -345,5 +345,48 @@ await test('tiny forceAtTokens policies never trigger TargetPressureConfigError 
   }
 })
 
+await test('mountSummary filters non-text blocks, avoids ~0K rounding, forwards requestHeader, and falls back to engine meter in isolated scopes', async () => {
+  const ctx = new Context()
+  const measureCalls = []
+  const meter = {
+    measure(session, header) {
+      measureCalls.push([session, header])
+      return { totalTokens: header ? 320 : 1200 }
+    },
+  }
+  const llm = {
+    listProviders: () => [{ id: 'test' }],
+    listModels: async () => [{ id: 'large' }],
+    resolveModelInfo: async () => ({ context: { contextWindow: 1000000 }, defaultMaxTokens: 1000 }),
+  }
+  ctx.provide('llm', llm)
+  ctx.provide('tokenMeter', meter)
+  ctx.provide('sessions', {})
+  await ctx.plugin(BasicCompactionEngine, { auto: false })
+  const compaction = ctx.get('compaction')
+  compaction.summarize = async () => ({
+    summary: [
+      { type: 'reasoning', text: '## Current Work\n- hidden thought\n## Next Step\n- hidden step' },
+      { type: 'text', text: '## Current Work\n- public work\n## Next Step\n- ship patch' },
+    ],
+  })
+  const isolatedPluginScope = ctx.isolate('tokenMeter')
+  await isolatedPluginScope.plugin(plugin, { note: 'both', minContextWindow: 500000, forceAtTokens: 200000 })
+  await flush()
+  try {
+    const reqHeader = { config: { provider: 'test', model: 'large' } }
+    const session = { requestHeader: () => reqHeader }
+    const result = await ctx.get('compaction').summarize({}, { session }, signal)
+    assert.equal(measureCalls.length, 1)
+    assert.equal(measureCalls[0][1], reqHeader)
+    assert.match(result.summary[2].text, /compacted at ~320 tokens/)
+    assert.doesNotMatch(result.summary[2].text, /~0K tokens|hidden thought|hidden step/)
+    assert.match(result.summary[2].text, /Where I was: public work/)
+    assert.match(result.summary[2].text, /Next: ship patch/)
+  } finally {
+    await ctx.fiber.dispose()
+  }
+})
+
 console.log(`${passed} passed, ${failed} failed (real Cordis lifecycle and shipped engine; controlled catalog and summarizer)`)
 if (failed) process.exitCode = 1
