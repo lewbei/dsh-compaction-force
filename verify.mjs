@@ -1048,6 +1048,165 @@ await test('extractSideConstraints: skips indented continuations inside syntheti
   assert.deepEqual(extractSideConstraints([{ role: 'user', content: [{ type: 'text', text: block }] }]), [])
 })
 
+await test('extractSideConstraints: preserves unindented bullet continuations and splits bullet sentences', () => {
+  assert.deepEqual(
+    extractSideConstraints([{ role: 'user', content: [{ type: 'text', text: '- Never deploy to production\nunless all tests pass.' }] }]),
+    ['Never deploy to production unless all tests pass.'],
+  )
+  assert.deepEqual(
+    extractSideConstraints([{ role: 'user', content: [{ type: 'text', text: '+ Never skip checks\nbefore merging.\n1. Always verify staging\nbefore release.' }] }]),
+    ['Never skip checks before merging.', 'Always verify staging before release.'],
+  )
+  assert.deepEqual(
+    extractSideConstraints([{
+      role: 'user',
+      content: [{ type: 'text', text: '<compacted-summary>\n## Active Constraints (preserve these)\n- Never deploy to production\n  without explicit approval\nunless all tests pass.\n</compacted-summary>' }],
+    }]),
+    ['Never deploy to production without explicit approval unless all tests pass.'],
+  )
+  assert.deepEqual(
+    extractSideConstraints([{ role: 'user', content: [{ type: 'text', text: '- Never deploy without approval.\n  Is staging ready?' }] }]),
+    ['Never deploy without approval.'],
+  )
+  assert.deepEqual(
+    extractSideConstraints([{ role: 'user', content: [{ type: 'text', text: '- Never deploy to prod. Can we skip staging?\n- Always verify staging. Never deploy on Fridays.' }] }]),
+    ['Never deploy to prod.', 'Always verify staging.', 'Never deploy on Fridays.'],
+  )
+})
+
+await test('extractSideConstraints: scopes synthetic and prior sections across blank lines, summary spans, echoed headings, and custom headings', () => {
+  const handoffNote = buildNoteText({ variant: 'handoff', summaryText: '## Current Work\n- working', sideConstraints: [] })
+  assert.deepEqual(
+    extractSideConstraints([{ role: 'user', content: [{ type: 'text', text: `${handoffNote}\n- Never push directly to main.` }] }]),
+    ['Never push directly to main.'],
+  )
+
+  const priorEightNote = buildNoteText({
+    variant: 'context',
+    summaryText: '## Current Work\n- working',
+    sideConstraints: Array.from({ length: 8 }, (_, i) => `Never do prior ${i + 1}.`),
+  })
+  const blankAfterPrior = extractSideConstraints([{ role: 'user', content: [{ type: 'text', text: `${priorEightNote}\n\nNever deploy without checking logs.` }] }])
+  assert.equal(blankAfterPrior[0], 'Never deploy without checking logs.')
+  assert.equal(blankAfterPrior.length, 8)
+
+  assert.deepEqual(
+    extractSideConstraints([{
+      role: 'user',
+      content: [
+        { type: 'text', text: '## Active Constraints (preserve these)\n- Real user rule: never push to main.' },
+        { type: 'text', text: '<compacted-summary>\n- Summary bullet before heading: must support legacy format.\n## Current Work\n- work\n</compacted-summary>' },
+      ],
+    }]),
+    ['Real user rule: never push to main.'],
+  )
+
+  assert.deepEqual(
+    extractSideConstraints([{
+      role: 'user',
+      content: [{
+        type: 'text',
+        text: '<compacted-summary>\n## Active Constraints (preserve these)\n- Always verify staging.\n</compacted-summary>\n<compacted-summary>\n- Leaked summary item: never trust prior span.\n</compacted-summary>',
+      }],
+    }]),
+    ['Always verify staging.'],
+  )
+
+  const llmSummary = [
+    '## Primary Request and Intent',
+    '- Build parser.',
+    '## Active Constraints (preserve these)',
+    ...Array.from({ length: 8 }, (_, i) => `- Stale LLM paraphrase ${i + 1}: must do X${i + 1}.`),
+  ].join('\n')
+  const echoedNote = buildNoteText({ variant: 'handoff', summaryText: llmSummary, sideConstraints: ['Never touch prod.'] })
+  assert.deepEqual(
+    extractSideConstraints([{
+      role: 'user',
+      content: [
+        { type: 'text', text: 'Preamble\n\n<compacted-summary>' },
+        { type: 'text', text: llmSummary },
+        { type: 'text', text: echoedNote },
+        { type: 'text', text: '</compacted-summary>' },
+      ],
+    }]),
+    ['Never touch prod.'],
+  )
+
+  const unclosedFenceSummary = '## Current Work\n```js\nconst broken = 1\n'
+  const noteAfterUnclosedFence = buildNoteText({ variant: 'handoff', summaryText: unclosedFenceSummary, sideConstraints: ['Always preserve across unclosed fence.'] })
+  assert.deepEqual(
+    extractSideConstraints([{
+      role: 'user',
+      content: [
+        { type: 'text', text: '<compacted-summary>' },
+        { type: 'text', text: unclosedFenceSummary },
+        { type: 'text', text: noteAfterUnclosedFence },
+        { type: 'text', text: '</compacted-summary>' },
+      ],
+    }]),
+    ['Always preserve across unclosed fence.'],
+  )
+
+  const tracebackSummary = [
+    '## Errors and Diagnostics',
+    'Traceback (most recent call last):',
+    '  File "/tmp/app.py", line 12, in run',
+    '    # inspect state before running',
+    'ValueError: bad state',
+  ].join('\n')
+  const noteAfterTraceback = buildNoteText({ variant: 'handoff', summaryText: tracebackSummary, sideConstraints: ['Always preserve across traceback comments.'] })
+  assert.deepEqual(
+    extractSideConstraints([{
+      role: 'user',
+      content: [
+        { type: 'text', text: '<compacted-summary>' },
+        { type: 'text', text: `${tracebackSummary}\n${noteAfterTraceback}` },
+        { type: 'text', text: '</compacted-summary>' },
+      ],
+    }]),
+    ['Always preserve across traceback comments.'],
+  )
+
+  const compactEchoedSummary = [
+    '## Active Constraints (preserve these)',
+    '- Stale LLM paraphrase: must ignore this.',
+    '## Next Step',
+    '- Run tests.',
+  ].join('\n')
+  const compactNote = buildNoteText({ variant: 'handoff', compact: true, summaryText: compactEchoedSummary, sideConstraints: ['Never bypass compact gate.'] })
+  assert.deepEqual(
+    extractSideConstraints([{
+      role: 'user',
+      content: [
+        { type: 'text', text: '<compacted-summary>' },
+        { type: 'text', text: `${compactEchoedSummary}\n${compactNote}` },
+        { type: 'text', text: '</compacted-summary>' },
+      ],
+    }], { heading: 'Next Step' }),
+    ['Never bypass compact gate.'],
+  )
+
+  assert.deepEqual(
+    extractSideConstraints([{
+      role: 'user',
+      content: [{
+        type: 'text',
+        text: '<compacted-summary>\n## Primary Request and Intent\n- Build parser.\n## Active Constraints (preserve these)\n- Stale echoed item: never trust this.\n## Next Step\n- Run tests.\n</compacted-summary>',
+      }],
+    }]),
+    [],
+  )
+
+  const customNote = buildNoteText({ variant: 'handoff', heading: 'Custom Handoff', summaryText: '## Critical Context\n- never edit /etc' })
+  assert.deepEqual(extractSideConstraints([{ role: 'user', content: [{ type: 'text', text: customNote }] }], { heading: '  Custom   Handoff  ' }), [])
+  const defaultNote = buildNoteText({ variant: 'handoff', summaryText: '## Critical Context\n- never edit /etc' })
+  assert.deepEqual(extractSideConstraints([{ role: 'user', content: [{ type: 'text', text: defaultNote }] }], { heading: '' }), [])
+  assert.deepEqual(
+    extractSideConstraints([{ role: 'user', content: [{ type: 'text', text: '## Current Work\n- Always run unit tests before editing.' }] }], { heading: 'Current Work' }),
+    ['Always run unit tests before editing.'],
+  )
+})
+
 await test('wrapSummarize: uses normalized defaults when options are omitted or partial', async () => {
   const input = { messages: [{ role: 'user', content: [{ type: 'text', text: 'Never deploy without approval.' }] }] }
   const defaultsEngine = makeEngine()
