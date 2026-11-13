@@ -498,16 +498,103 @@ function frameSummarySpans(texts) {
   return segments
 }
 
-const AT_PAREN_FRAME_RE = /^at\s+.+?\s*\((?:Native Method|Unknown Source|.*(?:[\/\\]|node:|file:\/\/|https?:\/\/|\.[A-Za-z0-9_]+|<anonymous>)\S*:\d+(?::\d+)?)\)$/
 const AT_BARE_FRAME_RE = /^at\s+(?:(?:node:|file:\/\/|[A-Za-z]:\\|\.\.?\/|\/)\S*:\d+(?::\d+)?|https?:\/\/\S+:\d+:\d+|\S+\.[A-Za-z0-9_]+:\d+:\d+|<anonymous>(?::\d+(?::\d+)?)?|\[[^\]]+\](?::\d+(?::\d+)?)?)$/
-const AT_SIGN_FRAME_RE = /^(?:[A-Za-z0-9_$.<>-]+(?:\s+[A-Za-z0-9_$.<>-]+){0,2})?@(?:https?:\/\/\S+:\d+:\d+|(?:file:\/\/\S+|\S+[\/\\]\S+|node:\S+|\S+\.[A-Za-z0-9_]+):\d+(?::\d+)?|\[native code\])$/
 const PYTHON_FRAME_RE = /^File\s+"[^"]+",\s+line\s+\d+(?:,\s+in\s+\S+)?$/
-const ERROR_HEADER_RE = /^(?:(?:Uncaught(?:\s+\([^)]+\)|\s+\S+)*\s+)?[A-Za-z0-9_.$]*(?:Error|Exception|Panic|Throwable)|Traceback(?:\s*\(most recent call last\))?|Caused by)\s*:/i
+const SIMPLE_ERROR_HEADER_RE = /^(?:[A-Za-z0-9_.$]*(?:Error|Exception|Panic|Throwable)|Traceback(?:\s*\(most recent call last\))?|Caused by)\s*:/i
+const PAREN_LOC_MARKER_RE = /(?:[\/\\]|node:|file:\/\/|https?:\/\/|\.[A-Za-z0-9_]+|<anonymous>)/
+const AT_SIGN_LHS_RE = /^(?:[A-Za-z0-9_$.<>-]+(?:\s+[A-Za-z0-9_$.<>-]+){0,2})?$/
+const ERROR_NAME_RE = /^[A-Za-z0-9_.$]*(?:Error|Exception|Panic|Throwable)$/i
+const ERROR_NAME_COLON_RE = /^[A-Za-z0-9_.$]*(?:Error|Exception|Panic|Throwable):/i
+
+function stripLineColSuffix(text) {
+  let i = text.length
+  while (i > 0 && text[i - 1] >= '0' && text[i - 1] <= '9') i -= 1
+  if (i === text.length || i === 0 || text[i - 1] !== ':') return null
+  const firstColon = i - 1
+  let j = firstColon
+  while (j > 0 && text[j - 1] >= '0' && text[j - 1] <= '9') j -= 1
+  if (j < firstColon && j > 0 && text[j - 1] === ':') {
+    return { base: text.slice(0, j - 1), hasCol: true }
+  }
+  return { base: text.slice(0, firstColon), hasCol: false }
+}
+
+function isAtParenFrame(trimmed) {
+  if (!/^at\s/.test(trimmed) || !trimmed.endsWith(')')) return false
+  let depth = 0
+  let openIdx = -1
+  for (let i = trimmed.length - 1; i >= 3; i -= 1) {
+    if (trimmed[i] === ')') depth += 1
+    else if (trimmed[i] === '(') {
+      depth -= 1
+      if (depth === 0) {
+        openIdx = i
+        break
+      }
+    }
+  }
+  if (openIdx <= 3) return false
+  const loc = trimmed.slice(openIdx + 1, trimmed.length - 1)
+  if (loc === 'Native Method' || loc === 'Unknown Source') return true
+  let tailStart = loc.length
+  while (tailStart > 0 && !/\s/.test(loc[tailStart - 1])) tailStart -= 1
+  const tail = loc.slice(tailStart)
+  const stripped = stripLineColSuffix(tail)
+  return stripped !== null && PAREN_LOC_MARKER_RE.test(stripped.base)
+}
+
+function isAtSignFrame(trimmed) {
+  const atIdx = trimmed.indexOf('@')
+  if (atIdx === -1) return false
+  if (!AT_SIGN_LHS_RE.test(trimmed.slice(0, atIdx))) return false
+  const rhs = trimmed.slice(atIdx + 1)
+  if (rhs === '[native code]') return true
+  if (rhs.length === 0 || /\s/.test(rhs)) return false
+  const stripped = stripLineColSuffix(rhs)
+  if (stripped === null) return false
+  const { base, hasCol } = stripped
+  if (/^https?:\/\/\S/.test(base) && hasCol) return true
+  if (/^(?:file:\/\/|node:)./.test(base)) return true
+  for (let i = 1; i + 1 < base.length; i += 1) {
+    if (base[i] === '/' || base[i] === '\\') return true
+  }
+  const dotIdx = base.lastIndexOf('.')
+  return dotIdx > 0 && /^[A-Za-z0-9_]+$/.test(base.slice(dotIdx + 1))
+}
+
+function isErrorHeader(trimmed) {
+  if (SIMPLE_ERROR_HEADER_RE.test(trimmed)) return true
+  if (!/^Uncaught\s/i.test(trimmed)) return false
+  let i = 8
+  let nextClose = -2
+  while (i < trimmed.length) {
+    const wsStart = i
+    while (i < trimmed.length && /\s/.test(trimmed[i])) i += 1
+    if (i === wsStart || i >= trimmed.length) return false
+    if (trimmed[i] === '(') {
+      if (nextClose !== -1 && nextClose <= i) nextClose = trimmed.indexOf(')', i + 1)
+      if (nextClose > i + 1 && (nextClose + 1 >= trimmed.length || /\s/.test(trimmed[nextClose + 1]))) {
+        i = nextClose + 1
+        continue
+      }
+    }
+    const tokStart = i
+    while (i < trimmed.length && !/\s/.test(trimmed[i])) i += 1
+    const tok = trimmed.slice(tokStart, i)
+    if (ERROR_NAME_COLON_RE.test(tok)) return true
+    if (ERROR_NAME_RE.test(tok)) {
+      let k = i
+      while (k < trimmed.length && /\s/.test(trimmed[k])) k += 1
+      if (trimmed[k] === ':') return true
+    }
+  }
+  return false
+}
 
 function isStackFrameLine(trimmed) {
-  return AT_PAREN_FRAME_RE.test(trimmed)
+  return isAtParenFrame(trimmed)
     || AT_BARE_FRAME_RE.test(trimmed)
-    || AT_SIGN_FRAME_RE.test(trimmed)
+    || isAtSignFrame(trimmed)
     || PYTHON_FRAME_RE.test(trimmed)
 }
 
@@ -529,15 +616,15 @@ function markTraceLines(entries) {
     ) {
       j += 1
     }
-    if (j > i + 1 && j < entries.length && !entries[j].inFence && (dropped[j] || ERROR_HEADER_RE.test(entries[j].trimmed))) {
+    if (j > i + 1 && j < entries.length && !entries[j].inFence && (dropped[j] || isErrorHeader(entries[j].trimmed))) {
       for (let k = i + 1; k < j; k += 1) dropped[k] = true
     }
   }
   for (let i = 1; i < entries.length; i += 1) {
-    if (dropped[i - 1] && !entries[i].inFence && ERROR_HEADER_RE.test(entries[i].trimmed)) dropped[i] = true
+    if (dropped[i - 1] && !entries[i].inFence && isErrorHeader(entries[i].trimmed)) dropped[i] = true
   }
   for (let i = entries.length - 2; i >= 0; i -= 1) {
-    if (dropped[i + 1] && !entries[i].inFence && ERROR_HEADER_RE.test(entries[i].trimmed)) dropped[i] = true
+    if (dropped[i + 1] && !entries[i].inFence && isErrorHeader(entries[i].trimmed)) dropped[i] = true
   }
   return dropped
 }
