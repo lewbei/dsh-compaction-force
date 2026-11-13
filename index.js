@@ -494,6 +494,50 @@ function frameSummarySpans(texts) {
   return segments
 }
 
+const AT_PAREN_FRAME_RE = /^at\s+.+?\s*\((?:Native Method|Unknown Source|.*(?:[\/\\]|node:|file:\/\/|https?:\/\/|\.[A-Za-z0-9_]+|<anonymous>)\S*:\d+(?::\d+)?)\)$/
+const AT_BARE_FRAME_RE = /^at\s+(?:(?:node:|file:\/\/|[A-Za-z]:\\|\.\.?\/|\/)\S*:\d+(?::\d+)?|https?:\/\/\S+:\d+:\d+|\S+\.[A-Za-z0-9_]+:\d+:\d+|<anonymous>(?::\d+(?::\d+)?)?|\[[^\]]+\](?::\d+(?::\d+)?)?)$/
+const AT_SIGN_FRAME_RE = /^(?:[A-Za-z0-9_$.<>-]+(?:\s+[A-Za-z0-9_$.<>-]+){0,2})?@(?:https?:\/\/\S+:\d+:\d+|(?:file:\/\/\S+|\S+[\/\\]\S+|node:\S+|\S+\.[A-Za-z0-9_]+):\d+(?::\d+)?|\[native code\])$/
+const PYTHON_FRAME_RE = /^File\s+"[^"]+",\s+line\s+\d+(?:,\s+in\s+\S+)?$/
+const ERROR_HEADER_RE = /^(?:(?:Uncaught(?:\s+\([^)]+\)|\s+\S+)*\s+)?[A-Za-z0-9_.$]*(?:Error|Exception|Panic|Throwable)|Traceback(?:\s*\(most recent call last\))?|Caused by)\s*:/i
+
+function isStackFrameLine(trimmed) {
+  return AT_PAREN_FRAME_RE.test(trimmed)
+    || AT_BARE_FRAME_RE.test(trimmed)
+    || AT_SIGN_FRAME_RE.test(trimmed)
+    || PYTHON_FRAME_RE.test(trimmed)
+}
+
+function markTraceLines(entries) {
+  const dropped = new Array(entries.length).fill(false)
+  for (let i = 0; i < entries.length; i += 1) {
+    if (!entries[i].inFence && isStackFrameLine(entries[i].trimmed)) dropped[i] = true
+  }
+  for (let i = 0; i < entries.length; i += 1) {
+    if (!dropped[i] || !/^File\s+"/.test(entries[i].trimmed)) continue
+    let j = i + 1
+    while (
+      j < entries.length
+      && j <= i + 2
+      && !entries[j].inFence
+      && entries[j].trimmed.length > 0
+      && entries[j].rawLine !== entries[j].rawLine.trimStart()
+      && !isStackFrameLine(entries[j].trimmed)
+    ) {
+      j += 1
+    }
+    if (j > i + 1 && j < entries.length && !entries[j].inFence && (dropped[j] || ERROR_HEADER_RE.test(entries[j].trimmed))) {
+      for (let k = i + 1; k < j; k += 1) dropped[k] = true
+    }
+  }
+  for (let i = 1; i < entries.length; i += 1) {
+    if (dropped[i - 1] && !entries[i].inFence && ERROR_HEADER_RE.test(entries[i].trimmed)) dropped[i] = true
+  }
+  for (let i = entries.length - 2; i >= 0; i -= 1) {
+    if (dropped[i + 1] && !entries[i].inFence && ERROR_HEADER_RE.test(entries[i].trimmed)) dropped[i] = true
+  }
+  return dropped
+}
+
 /**
  * Split one text block into extraction candidates.
  *
@@ -512,7 +556,8 @@ function frameSummarySpans(texts) {
  * @returns {Array<{ text: string, prior: boolean }>}
  */
 function splitSCCandidates(text, syntheticHeadings, state = { inSummary: false, section: 'none' }) {
-  const lines = String(text ?? '').replace(/\r\n?/g, '\n').split('\n')
+  const entries = scanBlockLines(text)
+  const dropped = markTraceLines(entries)
   const candidates = []
   let pending = null
   let inSyntheticBullet = false
@@ -525,8 +570,14 @@ function splitSCCandidates(text, syntheticHeadings, state = { inSummary: false, 
     }
     pending = null
   }
-  for (const rawLine of lines) {
-    const line = rawLine.trim()
+  for (let idx = 0; idx < entries.length; idx += 1) {
+    const { rawLine, trimmed: line, inFence } = entries[idx]
+    if (inFence || dropped[idx]) {
+      flushPending()
+      inSyntheticBullet = false
+      lastBullet = null
+      continue
+    }
     if (line.length === 0) {
       flushPending()
       inSyntheticBullet = false
