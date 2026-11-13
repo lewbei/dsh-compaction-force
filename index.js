@@ -70,13 +70,16 @@ const toPositiveInt = (value, fallback) => {
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback
 }
 
+const normalizeHeading = (value) => (
+  typeof value === 'string' ? value.replace(/[\r\n<>]+/g, ' ').replace(/\s+/g, ' ').trim() : ''
+)
+
 /** Normalize one row config into a complete, validated option set. */
 export function normalizeOptions(config = {}) {
   const forceAtTokens = toPositiveInt(config?.forceAtTokens, DEFAULTS.forceAtTokens)
   const minContextWindow = toPositiveInt(config?.minContextWindow, DEFAULTS.minContextWindow)
   const note = NOTE_VARIANTS.has(config?.note) ? config.note : DEFAULTS.note
-  const rawHeading = typeof config?.heading === 'string' ? config.heading : ''
-  const sanitizedHeading = rawHeading.replace(/[\r\n<>]+/g, ' ').replace(/\s+/g, ' ').trim()
+  const sanitizedHeading = normalizeHeading(config?.heading)
   const heading = sanitizedHeading.length > 0 ? sanitizedHeading : DEFAULTS.heading
   const scExtract = ['off', 'pattern'].includes(config?.scExtract) ? config.scExtract : DEFAULTS.scExtract
   return { forceAtTokens, minContextWindow, note, heading, scExtract }
@@ -285,24 +288,136 @@ export async function installPolicies(engine, llm, options = {}, commit) {
   return (await runInstallPolicies(engine, llm, options, commit)).installed
 }
 
+const BULLET_RE = /^(?:[-*+•]|\d{1,3}[.)])\s+(.*)$/
+
+function parseFenceOpen(trimmed) {
+  const match = trimmed.match(/^(`{3,}|~{3,})(.*)$/)
+  if (match === null) return null
+  const char = match[1][0]
+  if (char === '`' && match[2].includes('`')) return null
+  return { char, len: match[1].length }
+}
+
+function isFenceClose(trimmed, fence) {
+  if (fence === null) return false
+  const match = trimmed.match(/^(`{3,}|~{3,})\s*$/)
+  return match !== null && match[1][0] === fence.char && match[1].length >= fence.len
+}
+
+function scanBlockLines(text) {
+  const rawLines = String(text ?? '').replace(/\r\n?/g, '\n').split('\n')
+  const entries = []
+  let fence = null
+  for (const rawLine of rawLines) {
+    const trimmed = rawLine.trim()
+    if (fence !== null) {
+      const closed = isFenceClose(trimmed, fence)
+      entries.push({ rawLine, trimmed, inFence: true })
+      if (closed) fence = null
+      continue
+    }
+    const opened = parseFenceOpen(trimmed)
+    if (opened !== null) {
+      fence = opened
+      entries.push({ rawLine, trimmed, inFence: true })
+      continue
+    }
+    entries.push({ rawLine, trimmed, inFence: false })
+  }
+  return entries
+}
+
+function truncateBalanced(text, maxChars, suffix = '…') {
+  if (text.length <= maxChars) return text
+  if (maxChars <= 0) return ''
+  if (maxChars <= suffix.length) return suffix.slice(0, maxChars)
+  let cut = text.slice(0, maxChars - suffix.length)
+  let openRunLen = 0
+  let openAt = -1
+  let idx = 0
+  while (idx < cut.length) {
+    if (cut[idx] === '`') {
+      let end = idx
+      while (end < cut.length && cut[end] === '`') end += 1
+      const runLen = end - idx
+      if (openRunLen === 0) {
+        openRunLen = runLen
+        openAt = idx
+      } else if (runLen === openRunLen) {
+        openRunLen = 0
+        openAt = -1
+      }
+      idx = end
+    } else {
+      idx += 1
+    }
+  }
+  if (openRunLen > 0) {
+    if (openAt + openRunLen >= cut.length) {
+      cut = cut.slice(0, openAt).trimEnd()
+    } else {
+      const room = maxChars - suffix.length - openRunLen
+      const body = room > openAt + openRunLen ? cut.slice(0, room).replace(/`+$/, '') : ''
+      if (body.length > openAt + openRunLen) cut = `${body}${'`'.repeat(openRunLen)}`
+      else cut = cut.slice(0, openAt).trimEnd()
+    }
+  }
+  return `${cut}${suffix}`
+}
+
 /** Extract up to maxBullets bullet items under one `## Heading` section. */
 export function sectionBullets(summaryText, heading, maxBullets = 2, maxChars = 400) {
-  const lines = String(summaryText ?? '').replace(/\r\n?/g, '\n').split('\n')
-  const target = `## ${heading}`.toLowerCase()
-  const start = lines.findIndex((line) => line.trim().toLowerCase() === target)
-  if (start < 0) return []
-  const bullets = []
-  for (let index = start + 1; index < lines.length; index += 1) {
-    const line = lines[index]
-    if (/^#{1,6}\s/.test(line.trim())) break
-    const match = line.match(/^\s*[-*]\s+(.*)$/)
-    if (match === null) continue
-    const text = match[1].trim()
-    if (text.length === 0) continue
-    bullets.push(text.length > maxChars ? `${text.slice(0, maxChars)}…` : text)
-    if (bullets.length >= maxBullets) break
+  if (!Number.isFinite(maxBullets) || maxBullets <= 0) return []
+  if (!Number.isFinite(maxChars) || maxChars <= 0) return []
+  const target = normalizeHeading(heading).toLowerCase()
+  if (target.length === 0) return []
+  const lines = scanBlockLines(summaryText)
+  let inSection = false
+  const collected = []
+  let activeBullet = false
+  for (const { rawLine, trimmed, inFence } of lines) {
+    if (inFence) {
+      activeBullet = false
+      continue
+    }
+    const headingMatch = trimmed.match(/^(#{1,6})\s+(.*)$/)
+    if (headingMatch !== null) {
+      const level = headingMatch[1].length
+      const title = normalizeHeading(headingMatch[2]).toLowerCase()
+      if (!inSection) {
+        if (level === 2 && title === target) inSection = true
+        continue
+      }
+      if (level <= 2) break
+      activeBullet = false
+      continue
+    }
+    if (!inSection) continue
+    if (trimmed.length === 0 || /^(?:(?:-(?:\s*-){2,}|\*(?:\s*\*){2,}|_(?:\s*_){2,})$|>)/.test(trimmed)) {
+      activeBullet = false
+      continue
+    }
+    const match = trimmed.match(BULLET_RE)
+    if (match !== null) {
+      const item = match[1].trim()
+      if (item.length > 0) {
+        collected.push(item)
+        activeBullet = true
+      } else {
+        activeBullet = false
+      }
+      continue
+    }
+    if (activeBullet && collected.length > 0 && (rawLine !== rawLine.trimStart() || !/[.!?]$/.test(collected[collected.length - 1]))) {
+      collected[collected.length - 1] = `${collected[collected.length - 1]} ${trimmed}`
+    } else {
+      activeBullet = false
+    }
   }
-  return bullets
+  return collected
+    .filter((item) => !/^\(?none\)?\.?$/i.test(item))
+    .slice(0, maxBullets)
+    .map((item) => truncateBalanced(item, maxChars))
 }
 
 /** Heading of the plugin's own Active Constraints section (generated, not user). */
@@ -316,7 +431,6 @@ const SC_AUTHORITY_LINE = 'this checkpoint is the authoritative record of that s
 
 const COMPACT_OPEN_TAG = '<compacted-summary>'
 const COMPACT_CLOSE_TAG = '</compacted-summary>'
-const BULLET_RE = /^(?:[-*+•]|\d{1,3}[.)])\s+(.*)$/
 
 function splitMessageSegments(texts) {
   const segments = []
