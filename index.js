@@ -371,11 +371,22 @@ function scanBlockLines(text) {
   return entries
 }
 
+const safeSlice = (text, end) => {
+  if (end <= 0) return ''
+  if (end >= text.length) return text
+  const prev = text.charCodeAt(end - 1)
+  const next = text.charCodeAt(end)
+  if (prev >= 0xD800 && prev <= 0xDBFF && next >= 0xDC00 && next <= 0xDFFF) {
+    return text.slice(0, end - 1)
+  }
+  return text.slice(0, end)
+}
+
 function truncateBalanced(text, maxChars, suffix = '…') {
   if (text.length <= maxChars) return text
   if (maxChars <= 0) return ''
-  if (maxChars <= suffix.length) return suffix.slice(0, maxChars)
-  let cut = text.slice(0, maxChars - suffix.length)
+  if (maxChars <= suffix.length) return safeSlice(suffix, maxChars)
+  let cut = safeSlice(text, maxChars - suffix.length)
   let openRunLen = 0
   let openAt = -1
   let idx = 0
@@ -398,12 +409,12 @@ function truncateBalanced(text, maxChars, suffix = '…') {
   }
   if (openRunLen > 0) {
     if (openAt + openRunLen >= cut.length) {
-      cut = cut.slice(0, openAt).trimEnd()
+      cut = safeSlice(cut, openAt).trimEnd()
     } else {
       const room = maxChars - suffix.length - openRunLen
-      const body = room > openAt + openRunLen ? cut.slice(0, room).replace(/`+$/, '') : ''
+      const body = room > openAt + openRunLen ? safeSlice(cut, room).replace(/`+$/, '') : ''
       if (body.length > openAt + openRunLen) cut = `${body}${'`'.repeat(openRunLen)}`
-      else cut = cut.slice(0, openAt).trimEnd()
+      else cut = safeSlice(cut, openAt).trimEnd()
     }
   }
   return `${cut}${suffix}`
@@ -1249,16 +1260,41 @@ function fitNoteToBudget(noteArgs, baseSummary, budget, meter) {
       }
     }
     const constraints = Array.isArray(noteArgs.sideConstraints) ? noteArgs.sideConstraints : []
-    for (let count = constraints.length; count >= 1; count -= 1) {
-      const scBlock = renderActiveConstraints(constraints.slice(0, count), true)
-      const candidate = scBlock.length > 0 ? `\n\n${scBlock}\n` : ''
-      if (candidate.length > 0 && fits(candidate)) return candidate
-    }
-    if (noteArgs.variant !== 'off') {
-      const variants = noteArgs.variant === 'both' ? ['handoff', 'context'] : [noteArgs.variant]
-      for (const variant of variants) {
-        const candidate = buildNoteText({ ...noteArgs, variant, sideConstraints: [], compact: true })
-        if (candidate.length > 0 && fits(candidate)) return candidate
+    const validConstraints = constraints.filter((sc) => renderActiveConstraints([sc], true).length > 0)
+    if (validConstraints.length > 0) {
+      const allSc = renderActiveConstraints(validConstraints, true)
+      const allScCandidate = allSc.length > 0 ? `\n\n${allSc}\n` : ''
+      if (allScCandidate.length > 0 && fits(allScCandidate)) return allScCandidate
+      const kept = []
+      let bestCandidate = ''
+      if (validConstraints.length > 1) {
+        for (let i = 0; i < validConstraints.length; i += 1) {
+          if (i === validConstraints.length - 1 && kept.length === i) continue
+          const trial = [...kept, validConstraints[i]]
+          const scBlock = renderActiveConstraints(trial, true)
+          const candidate = scBlock.length > 0 ? `\n\n${scBlock}\n` : ''
+          if (candidate.length > bestCandidate.length && fits(candidate)) {
+            kept.push(validConstraints[i])
+            bestCandidate = candidate
+          }
+        }
+      }
+      if (kept.length > 0) {
+        if (noteArgs.variant !== 'off') {
+          const candidates = noteArgs.variant === 'both' ? ['both', 'handoff', 'context'] : [noteArgs.variant]
+          for (const variant of candidates) {
+            const candidate = buildNoteText({ ...noteArgs, variant, sideConstraints: kept, compact: true })
+            if (candidate.length > 0 && fits(candidate)) return candidate
+          }
+        }
+        return bestCandidate
+      }
+      if (noteArgs.variant !== 'off') {
+        const variants = noteArgs.variant === 'both' ? ['handoff', 'context'] : [noteArgs.variant]
+        for (const variant of variants) {
+          const candidate = buildNoteText({ ...noteArgs, variant, sideConstraints: [], compact: true })
+          if (candidate.length > 0 && fits(candidate)) return candidate
+        }
       }
     }
     return ''

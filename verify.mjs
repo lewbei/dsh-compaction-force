@@ -2268,6 +2268,46 @@ await test('wrapSummarize: fits or drops optional note framing within shadowed t
   wrapSummarize(noMeasureEngine, fakeCtx({ tokenMeter: { estimateMessage } }), { note: 'both', scExtract: 'pattern' })
   const noMeasureRes = await noMeasureEngine.summarize(surfaceInput, { session: surfaceSession }, undefined)
   assert.equal(noMeasureRes.summary.length, 1)
+
+  const skipHugeEngine = makeEngine('## Current Work\n- Doing X.\n## Next Step\n- Test X.')
+  wrapSummarize(skipHugeEngine, fakeCtx({ tokenMeter: makeMeter() }), { note: 'both', scExtract: 'pattern' })
+  const longScItem = 'Never ' + 'deploy '.repeat(30) + 'to production without rollback.'
+  const shortScItem = 'Always keep SQLite WAL.'
+  const shortOnlyTokens = framedTokens([
+    { type: 'text', text: '## Current Work\n- Doing X.\n## Next Step\n- Test X.' },
+    { type: 'text', text: `\n\n## Active Constraints (preserve these)\n- ${shortScItem}\n` },
+  ])
+  const skipHugeInput = makeInputWithBudget(shortOnlyTokens + 2, `${longScItem}\n${shortScItem}`)
+  const skipHugeRes = await skipHugeEngine.summarize(skipHugeInput, { session: {} }, undefined)
+  assert.equal(skipHugeRes.summary.length, 2)
+  assert.match(skipHugeRes.summary[1].text, /Always keep SQLite WAL\./)
+  assert.doesNotMatch(skipHugeRes.summary[1].text, /rollback/)
+  assert.doesNotMatch(skipHugeRes.summary[1].text, /Where I was:/)
+
+  const framingWithSurvivingScEngine = makeEngine('## Current Work\n- Doing Y.\n## Next Step\n- Ship Y.')
+  wrapSummarize(framingWithSurvivingScEngine, fakeCtx({ tokenMeter: makeMeter() }), { note: 'both', scExtract: 'pattern' })
+  const shortScTwo = 'Never mutate global cache.'
+  const handoffPlusTwoShort = buildNoteText({
+    variant: 'handoff',
+    heading: DEFAULTS.heading,
+    summaryText: '## Current Work\n- Doing Y.\n## Next Step\n- Ship Y.',
+    sideConstraints: [shortScItem, shortScTwo],
+    compact: true,
+  })
+  const framingPlusSurvivingTokens = framedTokens([
+    { type: 'text', text: '## Current Work\n- Doing Y.\n## Next Step\n- Ship Y.' },
+    { type: 'text', text: handoffPlusTwoShort },
+  ])
+  const multiSurvivingInput = makeInputWithBudget(
+    framingPlusSurvivingTokens + 2,
+    `${longScItem}\n${shortScItem}\n${'Never '.concat('rebuild '.repeat(30), 'live schema.')}\n${shortScTwo}`,
+  )
+  const multiSurvivingRes = await framingWithSurvivingScEngine.summarize(multiSurvivingInput, { session: {} }, undefined)
+  assert.equal(multiSurvivingRes.summary.length, 2)
+  assert.match(multiSurvivingRes.summary[1].text, /Where I was: Doing Y/)
+  assert.match(multiSurvivingRes.summary[1].text, /Always keep SQLite WAL\./)
+  assert.match(multiSurvivingRes.summary[1].text, /Never mutate global cache\./)
+  assert.doesNotMatch(multiSurvivingRes.summary[1].text, /rollback|live schema/)
 })
 
 await test('sectionBullets: handles fences, subheadings, numbered/+ bullets, continuations, placeholders, whitespace, and bounds', () => {
@@ -2314,6 +2354,25 @@ await test('sectionBullets: handles fences, subheadings, numbered/+ bullets, con
   assert.deepEqual(sectionBullets('## Current Work\n- Use ``a`b`` extra words', 'Current Work', 2, 11), ['Use ``a``…'])
   assert.deepEqual(sectionBullets('## Current Work\n- Use `a``b` extra words', 'Current Work', 2, 10), ['Use `a`…'])
   assert.deepEqual(sectionBullets('## Current Work\n- Avoid ``a```b`` extra words', 'Current Work', 2, 14), ['Avoid ``a``…'])
+  const surrogateBullet = 'x'.repeat(398) + '🧪' + 'tail'
+  const sbSurrogate = sectionBullets(`## Current Work\n- ${surrogateBullet}`, 'Current Work', 2, 400)
+  assert.equal(sbSurrogate.length, 1)
+  assert.equal(sbSurrogate[0].isWellFormed(), true)
+  assert.ok(sbSurrogate[0].length <= 400)
+  const backtickSurrogate = sectionBullets('## Current Work\n- Use `ab🧪c` extra words', 'Current Work', 2, 9)
+  assert.equal(backtickSurrogate.length, 1)
+  assert.equal(backtickSurrogate[0].isWellFormed(), true)
+  assert.equal((backtickSurrogate[0].match(/`/g) || []).length % 2, 0)
+  assert.ok(backtickSurrogate[0].length <= 9)
+  const backtickRoomSurrogate = sectionBullets('## Current Work\n- Use `a🧪c` extra words', 'Current Work', 2, 9)
+  assert.deepEqual(backtickRoomSurrogate, ['Use `a`…'])
+  assert.equal(backtickRoomSurrogate[0].isWellFormed(), true)
+  const scSurrogate = extractSideConstraints([
+    { role: 'user', content: [{ type: 'text', text: 'Never delete ' + 'x'.repeat(223) + '🚀' + 'y'.repeat(30) + '.' }] },
+  ])
+  assert.equal(scSurrogate.length, 1)
+  assert.equal(scSurrogate[0].isWellFormed(), true)
+  assert.ok(scSurrogate[0].length <= 240)
 })
 
 await test('buildNoteText: handles omitted options, off/unknown variants with constraints, empty constraints, and unsafe headings', () => {
