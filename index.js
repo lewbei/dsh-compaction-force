@@ -45,7 +45,6 @@ export const DEFAULTS = Object.freeze({
 
 const NOTE_VARIANTS = new Set(['off', 'context', 'handoff', 'both'])
 const WRAPPED = Symbol.for('@local/dsh-compaction-force/wrapped')
-const RECEIPTS = Symbol.for('@local/dsh-compaction-force/receipts')
 const CORDIS_ORIGINAL = Symbol.for('cordis.original')
 const CATALOG_TTL_MS = 5 * 60 * 1000
 
@@ -642,21 +641,17 @@ const policyKey = policy => `${policy.provider}\u0000${policy.model}`
 const activeReceipts = new WeakMap()
 
 const getActiveReceipts = (engine) => {
-  if (engine[RECEIPTS] !== undefined) return engine[RECEIPTS]
-  let list = activeReceipts.get(engine)
+  const key = unwrapService(engine)
+  let list = activeReceipts.get(key)
   if (list === undefined) {
     list = []
-    try {
-      engine[RECEIPTS] = list
-    } catch {
-      activeReceipts.set(engine, list)
-    }
+    activeReceipts.set(key, list)
   }
   return list
 }
 
 function restorePolicies(engine, receipt) {
-  const list = engine[RECEIPTS] ?? activeReceipts.get(engine)
+  const list = activeReceipts.get(unwrapService(engine))
   let laterReceipts = []
   if (list !== undefined) {
     const idx = list.indexOf(receipt)
