@@ -456,23 +456,27 @@ function frameSummarySpans(texts) {
     }
   }
   spans.sort((a, b) => a[0] - b[0] || a[1] - b[1])
-  const inSummary = new Array(entries.length).fill(false)
+  const spanIds = new Array(entries.length).fill(0)
   let maxEnd = -1
   let spanIdx = 0
+  let nextSpanId = 0
   for (let idx = 0; idx < entries.length; idx += 1) {
     while (spanIdx < spans.length && spans[spanIdx][0] <= idx) {
-      if (spans[spanIdx][1] > maxEnd) maxEnd = spans[spanIdx][1]
+      if (spans[spanIdx][1] > maxEnd) {
+        if (idx >= maxEnd) nextSpanId += 1
+        maxEnd = spans[spanIdx][1]
+      }
       spanIdx += 1
     }
-    if (idx < maxEnd && !delimiters.has(idx)) inSummary[idx] = true
+    if (idx < maxEnd && !delimiters.has(idx)) spanIds[idx] = nextSpanId
   }
   const segments = []
   let activeBlock = -1
-  let activeInSummary = false
+  let activeSpanId = 0
   let lines = []
   const flush = () => {
     if (lines.length === 0) return
-    segments.push({ text: lines.join('\n'), inSummary: activeInSummary })
+    segments.push({ text: lines.join('\n'), inSummary: activeSpanId > 0, spanId: activeSpanId })
     lines = []
   }
   for (let idx = 0; idx < entries.length; idx += 1) {
@@ -482,11 +486,11 @@ function frameSummarySpans(texts) {
       continue
     }
     const { blockIdx, rawLine } = entries[idx]
-    const flag = inSummary[idx]
-    if (blockIdx !== activeBlock || flag !== activeInSummary) {
+    const spanId = spanIds[idx]
+    if (blockIdx !== activeBlock || spanId !== activeSpanId) {
       flush()
       activeBlock = blockIdx
-      activeInSummary = flag
+      activeSpanId = spanId
     }
     lines.push(rawLine)
   }
@@ -631,6 +635,75 @@ function emitCompletedPending(candidates, state) {
   }
 }
 
+const PLUGIN_HANDOFF_BULLET_RE = /^(?:Where I was|Next|Guardrails):\s|^Resume from the checkpoint above/i
+
+function flushLastBulletCandidates(candidates, state) {
+  if (state.lastBullet === null) return
+  for (const sentence of splitSentences(state.lastBullet.text)) {
+    if (sentence.length > 0) candidates.push({ text: sentence, prior: state.lastBullet.prior })
+  }
+  state.lastBullet = null
+}
+
+function isPluginHandoffSection(entries, startIdx) {
+  let bullets = 0
+  for (let j = startIdx + 1; j < entries.length; j += 1) {
+    const { rawLine, trimmed, inFence } = entries[j]
+    if (inFence) continue
+    if (trimmed.length === 0) break
+    if (/^#{1,6}\s+/.test(trimmed)) break
+    const bullet = trimmed.match(BULLET_RE)
+    if (bullet !== null) {
+      bullets += 1
+      if (!PLUGIN_HANDOFF_BULLET_RE.test(bullet[1].trim())) return false
+      continue
+    }
+    if (rawLine === rawLine.trimStart()) return false
+  }
+  return bullets > 0
+}
+
+function resolvePriorHeadingIdx(spanSegments, customHeading = DEFAULTS.heading.toLowerCase()) {
+  const builtInSynthetic = new Set([
+    SC_CONTEXT_NOTE_HEADING.toLowerCase(),
+    DEFAULTS.heading.toLowerCase(),
+  ])
+  const records = []
+  let current = null
+  for (const seg of spanSegments) {
+    const entries = scanBlockLines(seg.text)
+    const dropped = markTraceLines(entries)
+    for (let idx = 0; idx < entries.length; idx += 1) {
+      const { trimmed, inFence } = entries[idx]
+      if (inFence || dropped[idx]) continue
+      const heading = trimmed.match(/^#{1,6}\s+(.*)$/)
+      if (heading !== null) {
+        const name = normalizeHeading(heading[1]).toLowerCase()
+        current = {
+          ordinal: records.length,
+          isPriorCandidate: name === SC_SECTION_HEADING.toLowerCase(),
+          isSynthetic: builtInSynthetic.has(name) || (name === customHeading && isPluginHandoffSection(entries, idx)),
+          hasFooter: false,
+        }
+        records.push(current)
+        continue
+      }
+      if (current !== null && trimmed.toLowerCase().includes(SC_FOOTER)) {
+        current.hasFooter = true
+      }
+    }
+  }
+  const priorRecords = records.filter((rec) => rec.isPriorCandidate)
+  if (priorRecords.length === 0) return -1
+  const withFooter = priorRecords.filter((rec) => rec.hasFooter)
+  if (withFooter.length > 0) return withFooter.at(-1).ordinal
+  if (priorRecords.length === records.length) return priorRecords.at(-1).ordinal
+  const trailing = priorRecords.filter((rec) => (
+    !records.slice(rec.ordinal + 1).some((later) => !later.isSynthetic && !later.isPriorCandidate)
+  ))
+  return trailing.length > 0 ? trailing.at(-1).ordinal : -1
+}
+
 /**
  * Split one text block into extraction candidates.
  *
@@ -648,60 +721,87 @@ function emitCompletedPending(candidates, state) {
  *
  * @returns {Array<{ text: string, prior: boolean }>}
  */
-function splitSCCandidates(text, syntheticHeadings, state = { inSummary: false, section: 'none', pending: null }) {
+function splitSCCandidates(
+  text,
+  state = {
+    inSummary: false,
+    section: 'none',
+    pending: null,
+    lastBullet: null,
+    inSyntheticBullet: false,
+    authorizedPriorHeadingIdx: -1,
+    headingOrdinal: -1,
+  },
+  customHeading = DEFAULTS.heading.toLowerCase(),
+) {
   if (!('pending' in state)) state.pending = null
+  if (!('lastBullet' in state)) state.lastBullet = null
+  if (!('inSyntheticBullet' in state)) state.inSyntheticBullet = false
+  const builtInSynthetic = new Set([
+    SC_CONTEXT_NOTE_HEADING.toLowerCase(),
+    DEFAULTS.heading.toLowerCase(),
+  ])
   const entries = scanBlockLines(text)
   const dropped = markTraceLines(entries)
   const candidates = []
-  let inSyntheticBullet = false
-  let lastBullet = null
   for (let idx = 0; idx < entries.length; idx += 1) {
     const { rawLine, trimmed: line, inFence } = entries[idx]
     if (inFence || dropped[idx]) {
       flushPendingCandidates(candidates, state)
-      inSyntheticBullet = false
-      lastBullet = null
+      flushLastBulletCandidates(candidates, state)
+      state.inSyntheticBullet = false
       continue
     }
     if (line.length === 0) {
       flushPendingCandidates(candidates, state)
-      inSyntheticBullet = false
-      lastBullet = null
+      flushLastBulletCandidates(candidates, state)
+      state.inSyntheticBullet = false
+      if (!state.inSummary) state.section = 'none'
       continue
     }
     const heading = line.match(/^#{1,6}\s+(.*)$/)
     if (heading !== null) {
       flushPendingCandidates(candidates, state)
-      inSyntheticBullet = false
-      lastBullet = null
-      const name = heading[1].replace(/\s+/g, ' ').trim().toLowerCase()
-      if (name === SC_SECTION_HEADING.toLowerCase()) state.section = 'prior'
-      else if (state.inSummary || syntheticHeadings.has(name)) state.section = 'synthetic'
-      else state.section = 'none'
+      flushLastBulletCandidates(candidates, state)
+      state.inSyntheticBullet = false
+      const name = normalizeHeading(heading[1]).toLowerCase()
+      if (state.inSummary) {
+        state.headingOrdinal += 1
+        if (name === SC_SECTION_HEADING.toLowerCase() && state.headingOrdinal === state.authorizedPriorHeadingIdx) {
+          state.section = 'prior'
+        } else {
+          state.section = 'synthetic'
+        }
+      } else if (name === SC_SECTION_HEADING.toLowerCase()) {
+        state.section = 'prior'
+      } else if (builtInSynthetic.has(name) || (name === customHeading && isPluginHandoffSection(entries, idx))) {
+        state.section = 'synthetic'
+      } else {
+        state.section = 'none'
+      }
       continue
     }
     if (state.section === 'synthetic') {
       if (BULLET_RE.test(line)) {
-        inSyntheticBullet = true
+        state.inSyntheticBullet = true
         continue
       }
-      if (state.inSummary || (inSyntheticBullet && rawLine !== rawLine.trimStart())) continue
+      if (state.inSummary || (state.inSyntheticBullet && rawLine !== rawLine.trimStart())) continue
       state.section = 'none'
-      inSyntheticBullet = false
+      state.inSyntheticBullet = false
     }
     const bullet = line.match(BULLET_RE)
     if (bullet !== null) {
       flushPendingCandidates(candidates, state)
-      const item = { text: bullet[1].trim(), prior: state.section === 'prior' }
-      candidates.push(item)
-      lastBullet = item
+      flushLastBulletCandidates(candidates, state)
+      state.lastBullet = { text: bullet[1].trim(), prior: state.section === 'prior' }
       continue
     }
-    if (lastBullet !== null && rawLine !== rawLine.trimStart()) {
-      lastBullet.text = `${lastBullet.text} ${line}`
+    if (state.lastBullet !== null && (rawLine !== rawLine.trimStart() || isContinuation(state.lastBullet.text, line))) {
+      state.lastBullet.text = `${state.lastBullet.text} ${line}`
       continue
     }
-    lastBullet = null
+    flushLastBulletCandidates(candidates, state)
     if (state.pending === null) {
       state.pending = line
       emitCompletedPending(candidates, state)
@@ -735,11 +835,8 @@ function splitSCCandidates(text, syntheticHeadings, state = { inSummary: false, 
  */
 export function extractSideConstraints(messages, options = {}) {
   const constraintRe = /\b(don'?t|do not|never|always|must(?:\s+not)?|should(?:\s+not)?|before (?:you|any)|wait for (?:my|your)|confirm (?:with|before)|ask (?:me|before)|show me (?:the|what)|until i (?:say|tell|confirm)|unless i|only (?:when|if|after)|no (?:emails?|messages?|files?|changes?|deletions?|emails|sending)|avoid|prevent|ensure (?:that|you)|require(?:d)? (?:that|to)|from now on|for the rest of (?:this )?session)\b/i
-  const syntheticHeadings = new Set([
-    SC_SECTION_HEADING.toLowerCase(),
-    SC_CONTEXT_NOTE_HEADING.toLowerCase(),
-    String(options.heading ?? DEFAULTS.heading).toLowerCase(),
-  ])
+  const sanitizedHeading = normalizeHeading(options?.heading)
+  const customHeading = (sanitizedHeading.length > 0 ? sanitizedHeading : DEFAULTS.heading).toLowerCase()
   const seen = new Set()
   const fresh = []
   const prior = []
@@ -771,26 +868,43 @@ export function extractSideConstraints(messages, options = {}) {
     const texts = content
       .filter((block) => block !== null && typeof block === 'object' && typeof block.text === 'string')
       .map((block) => block.text)
-    const state = { inSummary: false, section: 'none', pending: null }
+    const segments = frameSummarySpans(texts)
+    const state = {
+      inSummary: false,
+      section: 'none',
+      pending: null,
+      lastBullet: null,
+      inSyntheticBullet: false,
+      authorizedPriorHeadingIdx: -1,
+      headingOrdinal: -1,
+    }
     const stageCandidate = ({ text, prior: fromPrior }) => {
       stage(text.replace(/\s+/g, ' ').trim(), fromPrior)
     }
-    const flushStatePending = () => {
+    const flushStateBuffers = () => {
       const tail = []
       flushPendingCandidates(tail, state)
+      flushLastBulletCandidates(tail, state)
       for (const item of tail) stageCandidate(item)
     }
-    for (const seg of frameSummarySpans(texts)) {
-      if (seg.inSummary !== state.inSummary) {
-        flushStatePending()
+    let activeSpanId = 0
+    for (const seg of segments) {
+      if (seg.spanId !== activeSpanId) {
+        flushStateBuffers()
+        activeSpanId = seg.spanId
         state.inSummary = seg.inSummary
-        state.section = seg.inSummary ? (state.section === 'prior' ? 'prior' : 'synthetic') : 'none'
+        state.section = seg.inSummary ? 'synthetic' : 'none'
+        state.inSyntheticBullet = false
+        state.headingOrdinal = -1
+        state.authorizedPriorHeadingIdx = seg.inSummary
+          ? resolvePriorHeadingIdx(segments.filter((other) => other.spanId === seg.spanId), customHeading)
+          : -1
       }
-      for (const candidate of splitSCCandidates(seg.text, syntheticHeadings, state)) {
+      for (const candidate of splitSCCandidates(seg.text, state, customHeading)) {
         stageCandidate(candidate)
       }
     }
-    flushStatePending()
+    flushStateBuffers()
   }
   // New/fresh constraints win the cap; prior constraints from the previous
   // checkpoint are carried forward into the remaining slots so a lossy
