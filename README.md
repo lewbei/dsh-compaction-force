@@ -11,8 +11,7 @@ Requested behavior (2026-11-12):
    - `handoff` — a `## Note to Self (handoff)` section distilled from the
      checkpoint's own Current Work / Next Step / Critical Context sections.
 
-Mounted in the **Guarded** preset only (inside its `compaction` isolate group).
-The Standard preset is untouched.
+Mount this plugin inside a target preset's `compaction` isolate group (stock DSH web presets are `standard`, `ptc`, `minimal`, and `cordis`, each isolating its `compaction` service) or at profile root for profiles with a root compaction engine (such as `headless`). Stock presets leave the plugin unmounted until patched or bundled.
 
 ## Why a plugin instead of preset config
 
@@ -70,21 +69,27 @@ Config: `forceAtTokens` (default 262144), `minContextWindow` (default 500000),
 
 ## Verification
 
-- `node verify.mjs` — 59 assertions covering option normalization, policy
-  math/filtering/retention (including customized and retainTokens retention
-  modes and same-key field preservation), catalog caching and error skipping,
-  frozen-config replacement + merge, section extraction, both note styles,
-  degraded token meter, error propagation, idempotent wrap, multiline and
-  repeated-checkpoint constraint extraction, and the cordis wiring. Exit 0.
-- `node verify-policy-boundaries.mjs <installed DSH node_modules>` — 66
-  policy configurations plus a 72-combination retention matrix, all accepted by
-  the shipped `BasicCompactionEngine` constructor.
-- `node verify-lifecycle.mjs <installed DSH node_modules>` — 10 real-Cordis
-  lifecycle groups with the shipped engine and controlled catalog/summarizer
-  I/O.
-- `node verify-install.mjs` — 11 portable-mount fixture checks (see "Live
-  mounting") run against disposable temporary modules, never against a live
-  profile.
+- `npm test` runs `node verify.mjs && node verify-install.mjs` (both offline / disposable fixtures).
+- `node verify.mjs` — 75 assertions covering option normalization, policy
+  math/filtering/retention (tight-ratio and `retainTokens` preservation), async
+  and iterable catalog caching/updates, Cordis proxy unwrapping and overlapping
+  FIFO/LIFO disposal, `mountSummary` text-block/meter/token-budget guards,
+  CommonMark fence and heading extraction, balanced `<compacted-summary>` framing,
+  multiline/bullet/abbreviation sentence splitting, constraint carry-forward,
+  and Cordis wiring. Exit 0.
+- `node verify-policy-boundaries.mjs [<installed DSH node_modules>]` — 66
+  policy configurations plus a 72-combination retention matrix and tight-ratio
+  regressions, verified offline and against the shipped `BasicCompactionEngine`
+  constructor when DSH `node_modules` is supplied.
+- `node verify-lifecycle.mjs <installed DSH node_modules>` — 14 real-Cordis
+  lifecycle checks with the shipped `BasicCompactionEngine` and controlled
+  catalog/summarizer I/O, including overlapping FIFO proxy disposal, wrapper
+  layer preservation, tiny `forceAtTokens` pressure bounds, and tight-budget
+  checkpoints.
+- `node verify-install.mjs` — 17 portable-mount and CLI checks (see "Live
+  mounting") covering `scripts/prepare-patch.mjs`, `cordis.bundle.patch.yml`,
+  `catalog-report.mjs`, `benchmarks/compint-run/retention-bench.mjs`, docs, and
+  `package.json` against disposable fixtures, never against a live profile.
 - Real boot check (disposable headless profile + `--patch`, scaled
   `forceAtTokens: 500`, `minContextWindow: 1000`): pressure compaction fired on
   a tiny session (it would never fire under the default 0.8 ratio at that
@@ -97,22 +102,17 @@ Config: `forceAtTokens` (default 262144), `minContextWindow` (default 500000),
   - Where I was: No tool call has been executed yet; the request is still entirely outstanding.
   - Next: Call bash with command `python3 -c "print('A'*600)"`, ...
   ```
-- No in-repo suite composes a live profile or asserts preset structure; the
-  `verify*.mjs` suites validate plugin logic against the shipped engine and a
-  real Cordis runtime with controlled catalog/summarizer I/O. A structural
-  preset check would require a composed profile fixture and is not included.
-- `node catalog-report.mjs` (live composed profile, no boot): on the 2026-11-12
-  live profile this reports 105 models with a >500K window — **94 resolve
-  exactly 262,144**, 11 (openrouter models whose catalog declares a 943,718
-  output cap) resolve to 39,322 because the reserve term wins, and 36 models at
-  or below 500K are untouched. These counts depend on the live composed profile
-  and drift as the catalog syncs; regenerate them in your environment. The two
-  deepseek routes are adapter-owned: a headless enumeration showed
-  `deepseek-official/{deepseek-flash,deepseek-v4-pro}` (both 1,048,576 / 256,000)
-  and no models on `deepseek-account`, so the report is a lower bound for those
-  routes; the runtime plugin enumerates whatever the live process lists. The
-  report prints the per-model table so a catalog change is visible without a
-  live session.
+- `node catalog-report.mjs [--profile <name>] [--preset <id>]` (composed profile
+  via `dsh --profile ... --dump-config`, no runtime boot): dynamically discovers
+  active `compaction-force` scopes across presets (`standard`, `ptc`, `minimal`,
+  `cordis`, custom presets) or profile root (`headless`), honors sibling/root
+  `compaction-basic` overrides across `isolate.compaction` boundaries, resolves
+  `pi-ai` builtins (reserving `0` unless overridden by `modelOverrides` or route
+  `maxTokens`) plus enabled `deepseek-official` and `deepseek-account` routes,
+  and flags models skipped by `buildPolicies` or failing `BasicCompactionEngine`
+  pressure-budget validation. Historical 2026-11-12 point-in-time counts on a
+  custom test profile were 105 >500K models (94 at 262,144; 11 openrouter models
+  at 39,322; 36 <=500K untouched); stock profiles vary and drift as catalogs sync.
 - Reviewer hardening (2026-11-12): activation logs
   `compaction-force: installed N model policies ...` (or a warning when none
   installed) and retries the catalog enumeration twice when the boot catalog is
@@ -178,19 +178,21 @@ A generated patch looks like:
 
 Mounting rules:
 - The row **must** sit inside the compaction isolate group (the `compaction`
-  service is isolated there). The Guarded preset does exactly that. Applied at
-  a profile root the patch is inert in the web profile (its root
-  compaction-basic row is disabled) and only meaningful in a profile whose root
+  service is isolated there), such as inside a chosen DSH web preset
+  (`standard`, `ptc`, `minimal`, `cordis`) or a custom A/B preset; package
+  bundles can also reference `cordis.bundle.patch.yml` (`name: ./index.js`).
+  Applied at a profile root the patch is inert in the web profile (its root
+  `compaction-basic` row is disabled) and only active in a profile whose root
   engine exists, e.g. the headless harness.
 - The patch takes effect only after a **full DSH restart** of the target
   profile (the live process keeps previously imported modules in its ESM
   cache; the preset grid and its compaction engine are rebuilt at boot).
-- Validate the procedure on a disposable profile clone first (`node
-  verify-install.mjs` checks the patch generation and template/README
-  consistency without mounting anything). No live profile, link, or server is
-  changed by any of these steps — the profile's **default preset is Standard**,
-  so Standard sessions get none of this: select **Guarded** when creating a
-  session.
+- Validate the procedure on a disposable profile clone first (`npm test` and
+  `node verify-install.mjs` check patch preparation, `catalog-report.mjs`,
+  `retention-bench.mjs` CLI behavior, and template/README consistency without
+  mounting anything live). No live profile, link, or server is changed by any
+  of these steps; select the patched preset (or custom bundle preset) when
+  creating a session.
 
 ## Caveats
 

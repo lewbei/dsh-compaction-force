@@ -12,7 +12,8 @@
 #
 # Mounting rules:
 # - The row MUST sit inside the compaction isolate group (the `compaction`
-#   service is isolated there) — the Guarded preset does exactly that.
+#   service is isolated there), such as a target DSH web preset (`standard`,
+#   `ptc`, `minimal`, `cordis`) or a custom preset cloned for A/B testing.
 # - Applied at a PROFILE ROOT this patch is INERT in the web profile (its root
 #   compaction-basic row is disabled) and only meaningful in a profile whose
 #   root engine exists, e.g. the headless harness.

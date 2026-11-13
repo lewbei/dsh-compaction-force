@@ -3,7 +3,7 @@
 Run: `node benchmarks/compint-run/retention-bench.mjs --full`
 (config: seeds `101,202,303`; 100 instances per seed per arm; 8 constraints per
 scenario; 3 repeated-compaction generations; arms `off,context,handoff,both`).
-Timestamp: 2026-11-12, ~22:55 MYT, at repo `3a171b0` (all PRs #1–#8 merged).
+Timestamp: `2026-11-13T07:49:36Z`, commit `d270716` (PRs #11–#30 applied).
 Reproduce with the identical command; determinism was verified byte-identical
 across repeated runs.
 
@@ -11,10 +11,10 @@ across repeated runs.
 
 | Arm | Retention | Intact retention | found/total |
 |---|---:|---:|---:|
-| off | 0 % (0–0 across seeds) | 0 % (0–0) | 0/2400 |
-| context | 100 % (100–100) | 100 % (100–100) | 2400/2400 |
-| handoff | 100 % (100–100) | 100 % (100–100) | 2400/2400 |
-| both | 100 % (100–100) | 100 % (100–100) | 2400/2400 |
+| off | 0 % (0 %–0 % across seeds) | 0 % (0 %–0 %) | 0/2400 |
+| context | 100 % (100 %–100 % across seeds) | 100 % (100 %–100 %) | 2400/2400 |
+| handoff | 100 % (100 %–100 % across seeds) | 100 % (100 %–100 %) | 2400/2400 |
+| both | 100 % (100 %–100 % across seeds) | 100 % (100 %–100 %) | 2400/2400 |
 
 ## Repeated-compaction (3 generations)
 
