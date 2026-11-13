@@ -963,6 +963,81 @@ await test('extractSideConstraints: preserves wrapped multi-line user sentences'
   assert.deepEqual(extracted, ['Always deploy changes to the staging server only.'])
 })
 
+await test('extractSideConstraints: splits sentences accurately across wraps, abbreviations, quotes, and multi-block messages', () => {
+  assert.deepEqual(
+    extractSideConstraints([{ role: 'user', content: [{ type: 'text', text: 'Always run tests. Never skip\nCI checks.' }] }]),
+    ['Always run tests.', 'Never skip CI checks.'],
+  )
+
+  for (const [text, expected] of [
+    ['Never skip\n`verify.mjs` before merging.', ['Never skip `verify.mjs` before merging.']],
+    ['Never edit\nREADME.md without review.', ['Never edit README.md without review.']],
+    ['Always keep\n3 backups before migrating.', ['Always keep 3 backups before migrating.']],
+    ['You must\nNOT modify live profiles.', ['You must NOT modify live profiles.']],
+    ['Never deploy unless\nCI checks pass.', ['Never deploy unless CI checks pass.']],
+  ]) {
+    assert.deepEqual(extractSideConstraints([{ role: 'user', content: [{ type: 'text', text }] }]), expected)
+  }
+
+  assert.deepEqual(
+    extractSideConstraints([{ role: 'user', content: [{ type: 'text', text: 'Review docs\nNever overwrite production configs' }] }]),
+    ['Never overwrite production configs'],
+  )
+
+  assert.deepEqual(
+    extractSideConstraints([{ role: 'user', content: [{ type: 'text', text: 'Never edit system files, e.g. /etc/passwd or /etc/hosts.' }] }]),
+    ['Never edit system files, e.g. /etc/passwd or /etc/hosts.'],
+  )
+
+  assert.deepEqual(
+    extractSideConstraints([{ role: 'user', content: [{ type: 'text', text: 'Never deploy... unless tests pass.' }] }]),
+    ['Never deploy... unless tests pass.'],
+  )
+
+  assert.deepEqual(
+    extractSideConstraints([{ role: 'user', content: [{ type: 'text', text: 'Always follow "never push to main." Never skip code review.' }] }]),
+    ['Always follow "never push to main."', 'Never skip code review.'],
+  )
+
+  assert.deepEqual(
+    extractSideConstraints([{ role: 'user', content: [{ type: 'text', text: 'Did you ask "should we never deploy on Fridays?"' }] }]),
+    [],
+  )
+
+  assert.deepEqual(
+    extractSideConstraints([{ role: 'user', content: [{ type: 'text', text: 'Never deploy\n1000) Always verify.\n2026) Never push to main.\n1.5) Never skip checks.' }] }]),
+    ['Never deploy', '1000) Always verify.', '2026) Never push to main.', '1.5) Never skip checks.'],
+  )
+
+  assert.deepEqual(
+    extractSideConstraints([{ role: 'user', content: [{ type: 'text', text: 'Never say no. Always verify.\nNever deploy after 5 p.m. Always wait.\nAlways read docs, etc. Never skip tests.' }] }]),
+    ['Never say no.', 'Always verify.', 'Never deploy after 5 p.m.', 'Always wait.', 'Always read docs, etc.', 'Never skip tests.'],
+  )
+
+  assert.deepEqual(
+    extractSideConstraints([{ role: 'user', content: [{ type: 'text', text: 'Always update docs, e.g.\nREADME.md\nNever deploy...\nunless tests pass.\nAlways follow rules...\nNever improvise.' }] }]),
+    ['Always update docs, e.g. README.md', 'Never deploy... unless tests pass.', 'Always follow rules...', 'Never improvise.'],
+  )
+
+  assert.deepEqual(
+    extractSideConstraints([{
+      role: 'user',
+      content: [
+        { type: 'text', text: 'Never deploy\n<compacted-summary>\n## Current Work\n- working\n</compacted-summary>' },
+      ],
+    }]),
+    ['Never deploy'],
+  )
+
+  assert.deepEqual(
+    extractSideConstraints([{
+      role: 'user',
+      content: [{ type: 'text', text: 'Never deploy' }, { type: 'text', text: 'without explicit approval.' }],
+    }]),
+    ['Never deploy without explicit approval.'],
+  )
+})
+
 await test('extractSideConstraints: skips indented continuations inside synthetic notes', () => {
   const block = [
     '## Note to Self (handoff)',
