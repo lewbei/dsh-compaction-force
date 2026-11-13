@@ -638,8 +638,37 @@ export function extractSideConstraints(messages, options = {}) {
   return out
 }
 
+const ACTIVE_NOTE_VARIANTS = new Set(['context', 'handoff', 'both'])
+
+function renderActiveConstraints(sideConstraints, compact = false) {
+  if (!Array.isArray(sideConstraints) || sideConstraints.length === 0) return ''
+  const cleaned = []
+  for (const sc of sideConstraints) {
+    if (typeof sc !== 'string') continue
+    const normalized = sc.replace(/[\u0000-\u001f\u007f-\u009f]+/g, ' ').replace(/\s+/g, ' ').trim()
+    if (normalized.length > 0) cleaned.push(`- ${normalized}`)
+  }
+  if (cleaned.length === 0) return ''
+  const lines = ['## Active Constraints (preserve these)', ...cleaned]
+  if (!compact) lines.push('- These are user-issued side constraints for this session; they MUST survive every compaction.')
+  return lines.join('\n')
+}
+
 /** Build the note text appended to a checkpoint (empty string when nothing to add). */
-export function buildNoteText({ variant, heading = DEFAULTS.heading, summaryText = '', totalTokens = null, timestamp = null, sideConstraints = [], compact = false }) {
+export function buildNoteText(options = {}) {
+  const safeOptions = options ?? {}
+  const {
+    variant,
+    heading = DEFAULTS.heading,
+    summaryText = '',
+    totalTokens = null,
+    timestamp = null,
+    sideConstraints = [],
+    compact = false,
+  } = safeOptions
+  if (!ACTIVE_NOTE_VARIANTS.has(variant)) return ''
+  const normalizedHeading = normalizeHeading(heading)
+  const resolvedHeading = normalizedHeading.length > 0 ? normalizedHeading : DEFAULTS.heading
   const parts = []
   if (variant === 'context' || variant === 'both') {
     const size = Number.isInteger(totalTokens) && totalTokens > 0
@@ -658,21 +687,14 @@ export function buildNoteText({ variant, heading = DEFAULTS.heading, summaryText
           '- Re-read a file before editing it if you are relying on a pre-compaction memory.',
         ].join('\n'))
   }
-  if (Array.isArray(sideConstraints) && sideConstraints.length > 0) {
-    const scLines = ['## Active Constraints (preserve these)']
-    for (const sc of sideConstraints) {
-      // Sanitize so a constraint cannot inject extra markdown/newlines into the note.
-      scLines.push(`- ${String(sc).replace(/\s+/g, ' ').trim()}`)
-    }
-    if (!compact) scLines.push('- These are user-issued side constraints for this session; they MUST survive every compaction.')
-    parts.push(scLines.join('\n'))
-  }
+  const scBlock = renderActiveConstraints(sideConstraints, compact)
+  if (scBlock.length > 0) parts.push(scBlock)
   if (variant === 'handoff' || variant === 'both') {
     const maxChars = compact ? 100 : 300
     const where = sectionBullets(summaryText, 'Current Work', compact ? 2 : 3, maxChars)
     const next = sectionBullets(summaryText, 'Next Step', 1, maxChars)
     const guard = sectionBullets(summaryText, 'Critical Context', compact ? 2 : 3, maxChars)
-    const lines = [`## ${heading}`]
+    const lines = [`## ${resolvedHeading}`]
     if (where.length > 0) lines.push(`- Where I was: ${where.join(' ')}`)
     if (next.length > 0) lines.push(`- Next: ${next.join(' ')}`)
     if (guard.length > 0) lines.push(`- Guardrails: ${guard.join(' ')}`)
@@ -786,12 +808,8 @@ function fitNoteToBudget(noteArgs, baseSummary, budget, meter) {
     }
     const constraints = Array.isArray(noteArgs.sideConstraints) ? noteArgs.sideConstraints : []
     for (let count = constraints.length; count >= 1; count -= 1) {
-      const candidate = buildNoteText({
-        ...noteArgs,
-        variant: 'off',
-        sideConstraints: constraints.slice(0, count),
-        compact: true,
-      })
+      const scBlock = renderActiveConstraints(constraints.slice(0, count), true)
+      const candidate = scBlock.length > 0 ? `\n\n${scBlock}\n` : ''
       if (candidate.length > 0 && fits(candidate)) return candidate
     }
     if (noteArgs.variant !== 'off') {
